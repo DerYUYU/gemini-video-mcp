@@ -17,13 +17,6 @@ import { frageVideo, DEFAULT_TIMEOUT_MS, FehlerGemini } from './gemini.js';
  */
 const AUSSCHNITT_STATIC_MAX_S = 300;
 
-/**
- * Bis zu dieser Ausschnittslaenge waehlt "auto" zusaetzlich die hohe
- * Aufloesung. Darueber waere sie mit ~300 Tokens/Sekunde unverhaeltnismaessig
- * teuer -- wer sie trotzdem will, setzt detail: "hoch".
- */
-const AUSSCHNITT_HIGH_MAX_S = 120;
-
 export const MODI = ['agentic', 'static', 'auto'];
 export const DETAILSTUFEN = ['normal', 'hoch'];
 
@@ -154,17 +147,18 @@ export function waehleModus({ mode, detail, start, end }) {
   if (start !== null) processing.start_offset = alsOffset(start);
   if (end !== null) processing.end_offset = alsOffset(end);
 
+  // Hohe Aufloesung bleibt eine bewusste Entscheidung des Aufrufers. Gemessen
+  // am selben 2-Minuten-Ausschnitt: low 11.293 Tokens, high 35.922 Tokens --
+  // bei identischem Ergebnis, inklusive eines nur im Bild sichtbaren
+  // Repository-Namens. Der Dreifachpreis lohnt sich also nicht automatisch.
   let resolution;
   if (detail === 'hoch') {
     resolution = 'high';
-  } else if (hatAusschnitt && laenge !== null && laenge <= AUSSCHNITT_HIGH_MAX_S) {
-    resolution = 'high';
-    hinweise.push(`Ausschnitt unter ${AUSSCHNITT_HIGH_MAX_S} s -- hohe Aufloesung ist hier noch guenstig.`);
   } else {
     resolution = 'low';
     hinweise.push(
-      'Niedrige Aufloesung (~100 Tokens pro Videosekunde). Fuer Bildschirmtexte oder feine Details ' +
-        'detail: "hoch" setzen (~300 Tokens pro Videosekunde).',
+      'Niedrige Aufloesung (~100 Tokens pro Videosekunde). Sie liest auch Bildschirmtexte meist ' +
+        'zuverlaessig. Erst wenn feine Details fehlen, detail: "hoch" setzen (~300 Tokens pro Videosekunde).',
     );
   }
 

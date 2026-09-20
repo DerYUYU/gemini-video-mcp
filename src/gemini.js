@@ -61,7 +61,7 @@ export async function frageVideo({ url, prompt, processing, resolution, modell, 
       { timeout_ms: timeoutMs ?? DEFAULT_TIMEOUT_MS },
     );
   } catch (fehler) {
-    throw uebersetzeFehler(fehler, url);
+    throw uebersetzeFehler(fehler, url, await pruefeKey(client, fehler));
   }
 
   const text = leseAntworttext(antwort);
@@ -112,8 +112,38 @@ function textAusSteps(steps) {
     .trim();
 }
 
-/** Uebersetzt SDK-/HTTP-Fehler in verstaendliche deutsche Meldungen. */
-export function uebersetzeFehler(fehler, url) {
+/**
+ * Klaert bei mehrdeutigen Fehlern, ob der Key ueberhaupt gueltig ist.
+ *
+ * Noetig, weil die API die beiden haeufigsten Ursachen genau verkehrt herum
+ * signalisiert: ein nicht abrufbares Video liefert 403 "The caller does not
+ * have permission" (ohne jeden Hinweis aufs Video), ein ungueltiger Key
+ * dagegen 400 mit leerem Meldungstext. Ein `models.list` mit demselben Key
+ * kostet ~0,1 s und keine Tokens und trennt die Faelle eindeutig.
+ *
+ * @returns {Promise<boolean|null>} true/false, oder null wenn nicht geprueft.
+ */
+async function pruefeKey(client, fehler) {
+  const status = fehler?.status ?? fehler?.statusCode ?? fehler?.response?.status ?? null;
+  if (status !== 400 && status !== 403 && status !== 401) return null;
+  try {
+    await client.models.list({ config: { pageSize: 1 } });
+    return true;
+  } catch (pruefFehler) {
+    const text = String(pruefFehler?.message ?? '').toLowerCase();
+    if (text.includes('api key not valid') || text.includes('api_key_invalid')) return false;
+    return null; // Netzwerk o. ae. -- keine Aussage moeglich
+  }
+}
+
+/**
+ * Uebersetzt SDK-/HTTP-Fehler in verstaendliche deutsche Meldungen.
+ *
+ * @param {unknown} fehler
+ * @param {string} url
+ * @param {boolean|null} [keyGueltig] Ergebnis von pruefeKey, falls vorhanden.
+ */
+export function uebersetzeFehler(fehler, url, keyGueltig = null) {
   const status = fehler?.status ?? fehler?.statusCode ?? fehler?.response?.status ?? null;
   const roh = String(fehler?.message ?? fehler ?? '');
   const klein = roh.toLowerCase();
@@ -132,24 +162,25 @@ export function uebersetzeFehler(fehler, url) {
     );
   }
 
-  // Zuerst pruefen, ob es am Video liegt: ein privates Video quittiert die API
-  // teils ebenfalls mit 403/"permission denied", was sonst faelschlich als
-  // Key-Problem gemeldet wuerde.
+  // Das aktive Pruefergebnis schlaegt jede Textheuristik.
+  if (keyGueltig === false) return keyFehler(fehler);
+
   const gehtUmsVideo =
-    klein.includes('video') || klein.includes('youtube') || klein.includes('uri');
-  if (
-    (gehtUmsVideo || status === 404) &&
-    (klein.includes('private') ||
-      klein.includes('unlisted') ||
-      klein.includes('not accessible') ||
-      klein.includes('unavailable') ||
-      klein.includes('not found') ||
-      klein.includes('permission') ||
-      klein.includes('could not be fetched') ||
-      klein.includes('failed to fetch') ||
-      klein.includes('forbidden'))
-  ) {
-    return videoFehler(url, roh, fehler);
+    klein.includes('video') ||
+    klein.includes('youtube') ||
+    klein.includes('uri') ||
+    klein.includes('private') ||
+    klein.includes('unlisted') ||
+    klein.includes('not accessible') ||
+    klein.includes('unavailable') ||
+    klein.includes('not found') ||
+    klein.includes('could not be fetched') ||
+    klein.includes('failed to fetch');
+
+  // 403 heisst hier praktisch immer "Video nicht abrufbar": ein ungueltiger
+  // Key liefert 400, und genau das hat keyGueltig oben bereits ausgeschlossen.
+  if (gehtUmsVideo || status === 404 || (status === 403 && keyGueltig === true)) {
+    return videoFehler(url, roh, fehler, keyGueltig);
   }
 
   if (
@@ -159,12 +190,7 @@ export function uebersetzeFehler(fehler, url) {
     klein.includes('api key not valid') ||
     klein.includes('permission denied')
   ) {
-    return new FehlerGemini(
-      'Der Gemini-API-Key wurde abgelehnt (ungueltig, abgelaufen oder ohne Zugriff auf dieses Modell). ' +
-        'Pruefe GEMINI_API_KEY im AI Studio. Der Key wird hier bewusst nicht ausgegeben.',
-      'key_abgelehnt',
-      fehler,
-    );
+    return keyFehler(fehler);
   }
 
   if (
@@ -232,12 +258,23 @@ export function uebersetzeFehler(fehler, url) {
   );
 }
 
-function videoFehler(url, roh, fehler) {
+function videoFehler(url, roh, fehler, keyGueltig) {
+  const bestaetigt =
+    keyGueltig === true ? ' Der API-Key selbst wurde geprueft und ist gueltig.' : '';
   return new FehlerGemini(
     `Das Video unter ${url} konnte nicht geladen werden. Gemini verarbeitet nur oeffentliche ` +
       'YouTube-Videos -- private, nicht gelistete, geloeschte oder regional gesperrte Videos ' +
-      `schlagen fehl. Originalmeldung der API: ${kurz(roh)}`,
+      `schlagen fehl.${bestaetigt} Originalmeldung der API: ${kurz(roh)}`,
     'video_nicht_abrufbar',
+    fehler,
+  );
+}
+
+function keyFehler(fehler) {
+  return new FehlerGemini(
+    'Der Gemini-API-Key wurde abgelehnt (ungueltig, abgelaufen oder ohne Zugriff auf dieses Modell). ' +
+      'Pruefe GEMINI_API_KEY im AI Studio. Der Key wird hier bewusst nicht ausgegeben.',
+    'key_abgelehnt',
     fehler,
   );
 }
