@@ -1,0 +1,22 @@
+{
+  "name": "gemini-video-mcp",
+  "version": "0.1.0",
+  "description": "MCP-Server zur Analyse von YouTube-Videos ueber die Google Gemini API",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "gemini-video-mcp": "src/index.js"
+  },
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@google/genai": "^2.23.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.76"
+  }
+}
