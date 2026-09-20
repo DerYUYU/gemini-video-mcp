@@ -1,8 +1,8 @@
 # gemini-video-mcp
 
 An MCP server that lets Claude — or any other MCP client — understand public
-YouTube videos, both what is said and what is shown, through the Google Gemini
-API. It exposes a single tool, `analyze_video`, over stdio.
+YouTube and Instagram videos, both what is said and what is shown, through the
+Google Gemini API. It exposes a single tool, `analyze_video`, over stdio.
 
 ## Why
 
@@ -10,10 +10,12 @@ Language models cannot watch YouTube videos. The usual workaround is to paste a
 transcript by hand, which throws away everything that only appears on screen, or
 to ask a second app and copy the answer back. This server removes that detour:
 the client asks a question about a URL and gets an answer grounded in the audio
-*and* the video track.
+*and* the video track. The same call works for a YouTube link and an Instagram
+reel; the difference in how they are fetched is handled internally.
 
 ## What it does
 
+- YouTube videos and Instagram reels and video posts
 - Full analysis with chapters and timestamps across the whole video
 - Targeted analysis of a specific time range
 - Audio and visuals evaluated together — on-screen text, code, diagrams and
@@ -57,6 +59,12 @@ deliberate choice (`detail: "hoch"`), never automatic.
 
 - **Node 22 or newer** (developed and tested on 24.16)
 - **Your own Gemini API key** from [Google AI Studio](https://aistudio.google.com/apikey)
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — only for Instagram. YouTube
+  works without it.
+
+Install yt-dlp with `pipx install yt-dlp`, `brew install yt-dlp`,
+`winget install yt-dlp`, or grab a binary from its releases page. If it is not
+on your `PATH`, set `YTDLP_PATH` to the full path of the executable.
 
 ## Installation
 
@@ -149,6 +157,16 @@ only worth it on a short range:
 }
 ```
 
+**An Instagram reel** — same call, same arguments. The download and upload
+happen internally:
+
+```jsonc
+{
+  "url": "https://www.instagram.com/reel/POST_ID/",
+  "prompt": "What happens in this clip? Include timestamps."
+}
+```
+
 **Leaving out `prompt`** requests a full structured analysis: summary, chapters
 with timestamps covering the entire video, key statements, what is shown
 visually, and a closing assessment.
@@ -181,7 +199,7 @@ See [Response language](#response-language) for why this example is in German.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `url` | string | yes | — | URL of a **public** YouTube video. Accepts `watch?v=`, `youtu.be/`, `/shorts/`, `/live/` and `/embed/` forms. |
+| `url` | string | yes | — | URL of a **public** video. YouTube: `watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`. Instagram: `/reel/`, `/reels/`, `/p/`, `/tv/` and `/share/` links. No other platform. |
 | `prompt` | string | no | full analysis | The question to ask. Omitted, a complete structured analysis with chapters and timestamps is requested. |
 | `mode` | `agentic` \| `static` \| `auto` | no | `auto` | Processing mode, see below. |
 | `start` | string \| number | no | — | Start of a range: `"12:30"`, `"1:02:30"`, `"750s"`, or milliseconds as a number (`750000`). |
@@ -211,10 +229,46 @@ expensive fast on long videos.
 An explicit `mode` is honoured, except that `detail: "hoch"` always requires
 `static`. Any such override is reported in the answer under "Hinweise" (notes).
 
+## How Instagram works differently
+
+For YouTube, the video URL is handed to Gemini directly and Google fetches the
+video itself. Gemini cannot do that for Instagram, so the server takes a detour:
+
+1. `yt-dlp` downloads the video to a temporary directory
+2. the file is uploaded to the Gemini Files API
+3. the server waits until Google reports the file as `ACTIVE` — analysing it
+   earlier fails
+4. the analysis runs as usual
+5. the uploaded file is deleted at Google and the temporary file is removed,
+   including when a step in between fails
+
+What this means in practice:
+
+- **It is slower.** A short reel takes a few seconds to download and several
+  more to upload and process, before the analysis even starts. The YouTube path
+  has none of that overhead.
+- **It needs yt-dlp.** YouTube does not.
+- **Public posts only.** The server holds no cookies, no session and no login,
+  by design. Private accounts, stories and anything behind a login are out of
+  scope and are reported as such, not worked around.
+- **Video posts only.** Image posts and image carousels are rejected with a
+  clear message rather than a silent failure.
+- **Instagram support in yt-dlp can break.** Instagram changes its delivery
+  paths regularly and actively works against downloaders, so extraction that
+  works today may fail after a site change. A `yt-dlp -U` usually picks up the
+  fix. The server says so in the error message instead of reporting a generic
+  failure.
+- Downloads are capped at `MAX_VIDEO_MB` (250 MB by default), enforced both by
+  yt-dlp during the download and by the server before the upload.
+
+TikTok is deliberately not supported, even though yt-dlp could handle it.
+
 ## Limits and cost
 
 - **Public videos only.** Private, unlisted, deleted or region-blocked videos
-  fail.
+  fail. For Instagram this also covers private accounts and stories.
+- **Instagram costs extra time, not extra Gemini quota.** The download and the
+  file upload do not consume analysis tokens, but they do add wall-clock time.
 - **Free tier: 20 requests per day** for `gemini-3.8-flash`. This is the limit
   you will actually hit — not the frequently cited 8 hours of YouTube footage
   per day. Both are reported as HTTP 429.
@@ -265,11 +319,14 @@ the error path.
 | File | Purpose |
 |---|---|
 | `src/index.js` | MCP server, stdio transport, tool registration |
-| `src/analyze.js` | Input validation, mode selection, result formatting |
+| `src/analyze.js` | Input validation, mode selection, orchestration, result formatting |
 | `src/gemini.js` | Wrapper around `@google/genai` → `interactions`, error translation |
+| `src/quelle.js` | Platform detection, YouTube vs Instagram vs rejected |
+| `src/ytdlp.js` | Instagram download via yt-dlp, error translation |
+| `src/files.js` | Gemini Files API: upload, wait for `ACTIVE`, delete |
 | `src/prompt.js` | Default prompt and time-range addendum |
 | `src/time.js` | Time parsing, normalisation to seconds |
-| `src/youtube.js` | URL validation |
+| `src/youtube.js` | YouTube URL validation |
 
 `src/analyze.js` has no MCP dependencies and can be exercised directly from a
 Node script.
@@ -280,7 +337,11 @@ Node script.
 |---|---|---|---|
 | `GEMINI_API_KEY` | yes | — | Key from Google AI Studio |
 | `GEMINI_MODEL` | no | `gemini-3.8-flash` | Model to use |
-| `GEMINI_TIMEOUT_MS` | no | `600000` | Request timeout in milliseconds |
+| `GEMINI_TIMEOUT_MS` | no | `600000` | Timeout for the analysis request, in milliseconds |
+| `YTDLP_PATH` | no | `yt-dlp` from `PATH` | Full path to the yt-dlp executable (Instagram only) |
+| `YTDLP_TIMEOUT_MS` | no | `300000` | Timeout for the Instagram download |
+| `UPLOAD_TIMEOUT_MS` | no | `300000` | How long to wait for Gemini to process an uploaded file |
+| `MAX_VIDEO_MB` | no | `250` | Size ceiling for a downloaded Instagram video |
 
 ## License
 
