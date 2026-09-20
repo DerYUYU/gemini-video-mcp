@@ -260,8 +260,42 @@ What this means in practice:
   failure.
 - Downloads are capped at `MAX_VIDEO_MB` (250 MB by default), enforced both by
   yt-dlp during the download and by the server before the upload.
+- Cleanup runs even when a step fails, but it cannot run if the process is
+  killed outright. Should that happen, uploaded files expire at Google after
+  48 hours on their own.
 
 TikTok is deliberately not supported, even though yt-dlp could handle it.
+
+## Model fallback chain
+
+The free tier's daily limit applies **per model**, so an exhausted model does
+not mean the API is unusable. When a request comes back with HTTP 429 (quota
+exhausted) or 503 (model overloaded), the server retries the identical request
+against the next model in the chain instead of surfacing an error.
+
+Default chain, all of which support agentic video processing:
+
+1. `gemini-3.8-flash`
+2. `gemini-3.7-flash`
+3. `gemini-3.6-flash`
+4. `gemini-3.5-flash-lite`
+
+Rules:
+
+- **Only 429 and 503 trigger a switch.** An invalid key, a private video or a
+  malformed argument fails the same way on every model, so retrying would just
+  burn quota. Those errors are reported immediately.
+- **Each model is tried at most once.** When the whole chain is exhausted, the
+  error says so and points out that the quota resets daily.
+- **The switch is never silent.** The answer always names the model that
+  responded, and when a fallback was used, the notes say which models were
+  skipped and why.
+- **For Instagram the file is uploaded once.** The fallback reuses the same
+  uploaded file reference, so a model switch costs no extra upload.
+
+Set `GEMINI_MODEL` to choose the starting model — it always stays first in the
+chain. Set `GEMINI_MODEL_FALLBACKS` to a comma-separated list to replace the
+models tried after it.
 
 ## Limits and cost
 
@@ -269,9 +303,10 @@ TikTok is deliberately not supported, even though yt-dlp could handle it.
   fail. For Instagram this also covers private accounts and stories.
 - **Instagram costs extra time, not extra Gemini quota.** The download and the
   file upload do not consume analysis tokens, but they do add wall-clock time.
-- **Free tier: 20 requests per day** for `gemini-3.8-flash`. This is the limit
-  you will actually hit — not the frequently cited 8 hours of YouTube footage
-  per day. Both are reported as HTTP 429.
+- **Free tier: 20 requests per day, *per model*** — not per account, and not
+  the frequently cited 8 hours of YouTube footage per day. Because the limit is
+  per model, the server falls back through a chain of models automatically (see
+  below), so the practical ceiling is a multiple of 20 requests per day.
 - **Token cost in static mode** is about 100 tokens per video second at `low`
   and about 300 at `high`. Agentic mode does not scale this way; the
   measurements above are representative.
@@ -336,7 +371,8 @@ Node script.
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `GEMINI_API_KEY` | yes | — | Key from Google AI Studio |
-| `GEMINI_MODEL` | no | `gemini-3.8-flash` | Model to use |
+| `GEMINI_MODEL` | no | `gemini-3.8-flash` | Starting model, always first in the fallback chain |
+| `GEMINI_MODEL_FALLBACKS` | no | see chain above | Comma-separated models to fall back to on HTTP 429 or 503 |
 | `GEMINI_TIMEOUT_MS` | no | `600000` | Timeout for the analysis request, in milliseconds |
 | `YTDLP_PATH` | no | `yt-dlp` from `PATH` | Full path to the yt-dlp executable (Instagram only) |
 | `YTDLP_TIMEOUT_MS` | no | `300000` | Timeout for the Instagram download |
