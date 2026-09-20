@@ -55,6 +55,17 @@ Worth noting: `low` picked up the same on-screen-only GitHub repository name
 that `high` did, for a third of the cost. High resolution is therefore a
 deliberate choice (`detail: "hoch"`), never automatic.
 
+On a short clip the two modes cost about the same. Measured on a 51-second
+Instagram reel, same question:
+
+| Mode | Tokens | Answer |
+|---|---|---|
+| agentic | 5,570 | full breakdown, separating what is said from what is shown |
+| static, `low` | 5,288 | a shorter timestamped list |
+
+So `agentic` stays the default even for short videos: 5 % more tokens bought a
+noticeably richer answer, and the gap widens enormously as videos get longer.
+
 ## Requirements
 
 - **Node 22 or newer** (developed and tested on 24.16)
