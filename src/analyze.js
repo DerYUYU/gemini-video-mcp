@@ -78,6 +78,19 @@ export async function analyseVideo(args = {}) {
           timeoutMs: timeoutAusUmgebung(),
         });
 
+  // Ein Modellwechsel darf nicht stillschweigend passieren: der Nutzer soll
+  // sehen, dass nicht das angefragte Modell geantwortet hat, und warum.
+  const hinweise = [...plan.hinweise];
+  if (ergebnis.uebersprungen?.length) {
+    const liste = ergebnis.uebersprungen
+      .map((u) => `${u.modell} (${u.status === 429 ? 'Tageskontingent erschoepft' : 'ueberlastet'})`)
+      .join(', ');
+    hinweise.push(
+      `Automatisch auf ${ergebnis.modell} ausgewichen, weil nicht verfuegbar war: ${liste}. ` +
+        'Das Tageskontingent gilt pro Modell und wird taeglich zurueckgesetzt.',
+    );
+  }
+
   return {
     text: ergebnis.text,
     tokens: ergebnis.tokens,
@@ -91,7 +104,7 @@ export async function analyseVideo(args = {}) {
         start === null && end === null
           ? null
           : `${start !== null ? alsZeitcode(start) : 'Anfang'} - ${end !== null ? alsZeitcode(end) : 'Ende'}`,
-      hinweise: plan.hinweise,
+      hinweise,
       modell: ergebnis.modell,
       status: ergebnis.status,
       eigenerPrompt: Boolean(args.prompt?.trim()),
