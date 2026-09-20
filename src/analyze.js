@@ -4,10 +4,12 @@
  * damit sie sich direkt per Node-Skript testen laesst.
  */
 
-import { pruefeYoutubeUrl } from './youtube.js';
+import { erkenneQuelle } from './quelle.js';
 import { parseZeit, alsOffset, alsZeitcode } from './time.js';
 import { DEFAULT_PROMPT, mitZeitrahmen } from './prompt.js';
 import { frageVideo, DEFAULT_TIMEOUT_MS, FehlerGemini } from './gemini.js';
+import { ladeInstagramVideo, entferneVerzeichnis } from './ytdlp.js';
+import { ladeHoch, loescheDatei } from './files.js';
 
 /**
  * Bis zu dieser Ausschnittslaenge (Sekunden) schaltet "auto" von agentic auf
@@ -33,7 +35,7 @@ export const DETAILSTUFEN = ['normal', 'hoch'];
  * @returns {Promise<{text: string, tokens: number|null, meta: object}>}
  */
 export async function analyseVideo(args = {}) {
-  const { url } = pruefeYoutubeUrl(args.url);
+  const { url, plattform } = erkenneQuelle(args.url);
 
   const mode = args.mode ?? 'auto';
   if (!MODI.includes(mode)) {
@@ -65,19 +67,23 @@ export async function analyseVideo(args = {}) {
     plan.offsetsAktiv,
   );
 
-  const ergebnis = await frageVideo({
-    url,
-    prompt,
-    processing: plan.processing,
-    resolution: plan.resolution,
-    timeoutMs: timeoutAusUmgebung(),
-  });
+  const ergebnis =
+    plattform === 'instagram'
+      ? await frageInstagram({ url, prompt, plan })
+      : await frageVideo({
+          url,
+          prompt,
+          processing: plan.processing,
+          resolution: plan.resolution,
+          timeoutMs: timeoutAusUmgebung(),
+        });
 
   return {
     text: ergebnis.text,
     tokens: ergebnis.tokens,
     meta: {
       url,
+      plattform,
       modus: plan.modus,
       begruendung: plan.begruendung,
       aufloesung: plan.resolution ?? null,
@@ -91,6 +97,39 @@ export async function analyseVideo(args = {}) {
       eigenerPrompt: Boolean(args.prompt?.trim()),
     },
   };
+}
+
+/**
+ * Instagram-Pfad: herunterladen, hochladen, analysieren, aufraeumen.
+ *
+ * Das Aufraeumen steht im finally-Block, damit weder die temporaere Datei noch
+ * die Kopie bei Google liegen bleibt -- auch dann nicht, wenn die Analyse
+ * mitten im Lauf scheitert.
+ *
+ * Der Download laeuft vor der eigentlichen Anfrage und zaehlt deshalb nicht
+ * gegen GEMINI_TIMEOUT_MS: dieses Timeout gilt erst fuer den Analyse-Aufruf.
+ * Download und Verarbeitung haben ihre eigenen Zeitrahmen.
+ */
+async function frageInstagram({ url, prompt, plan }) {
+  let download = null;
+  let hochgeladen = null;
+
+  try {
+    download = await ladeInstagramVideo(url);
+    hochgeladen = await ladeHoch(download.pfad, download.mimeTyp, `instagram-${Date.now()}`);
+
+    return await frageVideo({
+      url: hochgeladen.uri,
+      mimeTyp: hochgeladen.mimeTyp,
+      prompt,
+      processing: plan.processing,
+      resolution: plan.resolution,
+      timeoutMs: timeoutAusUmgebung(),
+    });
+  } finally {
+    if (hochgeladen?.name) await loescheDatei(hochgeladen.name);
+    if (download?.verzeichnis) await entferneVerzeichnis(download.verzeichnis);
+  }
 }
 
 /**

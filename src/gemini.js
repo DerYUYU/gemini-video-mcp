@@ -39,20 +39,24 @@ export function resetClient() {
  * Schickt ein Video plus Frage an den interactions-Endpoint.
  *
  * @param {object} p
- * @param {string} p.url        Normalisierte YouTube-URL.
+ * @param {string} p.url        YouTube-URL oder URI einer hochgeladenen Datei.
  * @param {string} p.prompt     Die Frage an das Modell.
  * @param {'agentic'|object} p.processing  "agentic" oder {type:'static',...}.
  * @param {string} [p.resolution]  "low" | "medium" | "high" | "ultra_high".
+ * @param {string} [p.mimeTyp]  Nur fuer hochgeladene Dateien noetig.
  * @param {string} [p.modell]
  * @param {number} [p.timeoutMs]
  * @returns {Promise<{text: string, tokens: number|null, status: string, modell: string, usage: object}>}
  */
-export async function frageVideo({ url, prompt, processing, resolution, modell, timeoutMs }) {
+export async function frageVideo({ url, prompt, processing, resolution, mimeTyp, modell, timeoutMs }) {
   const client = holeClient();
   const modellName = modell || process.env.GEMINI_MODEL?.trim() || DEFAULT_MODELL;
 
   const video = { type: 'video', uri: url, processing };
   if (resolution) video.resolution = resolution;
+  // Nur der Instagram-Pfad setzt das. Ohne mimeTyp bleibt die Anfrage exakt
+  // die, die der YouTube-Pfad schon immer geschickt hat.
+  if (mimeTyp) video.mime_type = mimeTyp;
 
   let antwort;
   try {
