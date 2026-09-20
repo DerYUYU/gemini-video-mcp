@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * MCP-Server zur Analyse oeffentlicher YouTube-Videos mit der Google Gemini API.
+ * MCP-Server zur Analyse oeffentlicher Videos von YouTube und Instagram mit der
+ * Google Gemini API.
  * Transport: stdio.
  *
  * WICHTIG: stdout gehoert dem MCP-Protokoll. Jede Diagnoseausgabe muss nach
@@ -28,26 +29,32 @@ const server = new McpServer(
   { name: 'gemini-video-mcp', version: paket.version },
   {
     instructions:
-      'Analysiert oeffentliche YouTube-Videos mit Google Gemini. Tonspur und Bild werden gemeinsam ' +
-      'ausgewertet, ein separates Transkript ist nicht noetig. Fuer ganze Videos den Default-Modus ' +
-      '"auto" (agentic) nutzen -- er ist um ein Vielfaches guenstiger als die statische Verarbeitung.',
+      'Analysiert oeffentliche Videos von YouTube und Instagram mit Google Gemini. Tonspur und Bild ' +
+      'werden gemeinsam ausgewertet, ein separates Transkript ist nicht noetig. Fuer ganze Videos den ' +
+      'Default-Modus "auto" (agentic) nutzen -- er ist um ein Vielfaches guenstiger als die statische ' +
+      'Verarbeitung.',
   },
 );
 
 server.registerTool(
   'analyze_video',
   {
-    title: 'YouTube-Video analysieren',
+    title: 'Video analysieren (YouTube, Instagram)',
     description:
-      'Analysiert ein oeffentliches YouTube-Video mit Google Gemini und beantwortet eine Frage dazu. ' +
-      'Ohne "prompt" liefert das Tool eine vollstaendige Analyse mit Kapiteln, Zeitstempeln und ' +
-      'visuellen Details. Bild und Ton werden gemeinsam ausgewertet. Die Antwort weist immer den ' +
-      'Tokenverbrauch aus. Funktioniert nur mit oeffentlichen Videos (keine privaten oder nicht ' +
-      'gelisteten).',
+      'Analysiert ein oeffentliches Video von YouTube oder Instagram mit Google Gemini und ' +
+      'beantwortet eine Frage dazu. Ohne "prompt" liefert das Tool eine vollstaendige Analyse mit ' +
+      'Kapiteln, Zeitstempeln und visuellen Details. Bild und Ton werden gemeinsam ausgewertet. Die ' +
+      'Antwort weist immer den Tokenverbrauch aus. Funktioniert nur mit oeffentlichen Videos (keine ' +
+      'privaten oder nicht gelisteten). Instagram-Beitraege ohne Video, etwa reine Bilder oder ' +
+      'Bild-Karussells, lassen sich nicht analysieren.',
     inputSchema: {
       url: z
         .string()
-        .describe('URL des oeffentlichen YouTube-Videos, z. B. https://www.youtube.com/watch?v=VIDEOID'),
+        .describe(
+          'URL des oeffentlichen Videos. YouTube, z. B. https://www.youtube.com/watch?v=VIDEOID, ' +
+            'oder Instagram als Reel oder Video-Beitrag, z. B. https://www.instagram.com/reel/KENNUNG/. ' +
+            'Andere Plattformen werden nicht unterstuetzt.',
+        ),
       prompt: z
         .string()
         .optional()

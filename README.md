@@ -1,8 +1,8 @@
 # gemini-video-mcp
 
 An MCP server that lets Claude — or any other MCP client — understand public
-YouTube videos, both what is said and what is shown, through the Google Gemini
-API. It exposes a single tool, `analyze_video`, over stdio.
+YouTube and Instagram videos, both what is said and what is shown, through the
+Google Gemini API. It exposes a single tool, `analyze_video`, over stdio.
 
 ## Why
 
@@ -10,10 +10,12 @@ Language models cannot watch YouTube videos. The usual workaround is to paste a
 transcript by hand, which throws away everything that only appears on screen, or
 to ask a second app and copy the answer back. This server removes that detour:
 the client asks a question about a URL and gets an answer grounded in the audio
-*and* the video track.
+*and* the video track. The same call works for a YouTube link and an Instagram
+reel; the difference in how they are fetched is handled internally.
 
 ## What it does
 
+- YouTube videos and Instagram reels and video posts
 - Full analysis with chapters and timestamps across the whole video
 - Targeted analysis of a specific time range
 - Audio and visuals evaluated together — on-screen text, code, diagrams and
@@ -53,10 +55,27 @@ Worth noting: `low` picked up the same on-screen-only GitHub repository name
 that `high` did, for a third of the cost. High resolution is therefore a
 deliberate choice (`detail: "hoch"`), never automatic.
 
+On a short clip the two modes cost about the same. Measured on a 51-second
+Instagram reel, same question:
+
+| Mode | Tokens | Answer |
+|---|---|---|
+| agentic | 5,570 | full breakdown, separating what is said from what is shown |
+| static, `low` | 5,288 | a shorter timestamped list |
+
+So `agentic` stays the default even for short videos: 5 % more tokens bought a
+noticeably richer answer, and the gap widens enormously as videos get longer.
+
 ## Requirements
 
 - **Node 22 or newer** (developed and tested on 24.16)
 - **Your own Gemini API key** from [Google AI Studio](https://aistudio.google.com/apikey)
+- **[yt-dlp](https://github.com/yt-dlp/yt-dlp)** — only for Instagram. YouTube
+  works without it.
+
+Install yt-dlp with `pipx install yt-dlp`, `brew install yt-dlp`,
+`winget install yt-dlp`, or grab a binary from its releases page. If it is not
+on your `PATH`, set `YTDLP_PATH` to the full path of the executable.
 
 ## Installation
 
@@ -149,6 +168,16 @@ only worth it on a short range:
 }
 ```
 
+**An Instagram reel** — same call, same arguments. The download and upload
+happen internally:
+
+```jsonc
+{
+  "url": "https://www.instagram.com/reel/POST_ID/",
+  "prompt": "What happens in this clip? Include timestamps."
+}
+```
+
 **Leaving out `prompt`** requests a full structured analysis: summary, chapters
 with timestamps covering the entire video, key statements, what is shown
 visually, and a closing assessment.
@@ -181,7 +210,7 @@ See [Response language](#response-language) for why this example is in German.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `url` | string | yes | — | URL of a **public** YouTube video. Accepts `watch?v=`, `youtu.be/`, `/shorts/`, `/live/` and `/embed/` forms. |
+| `url` | string | yes | — | URL of a **public** video. YouTube: `watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`. Instagram: `/reel/`, `/reels/`, `/p/`, `/tv/` and `/share/` links. No other platform. |
 | `prompt` | string | no | full analysis | The question to ask. Omitted, a complete structured analysis with chapters and timestamps is requested. |
 | `mode` | `agentic` \| `static` \| `auto` | no | `auto` | Processing mode, see below. |
 | `start` | string \| number | no | — | Start of a range: `"12:30"`, `"1:02:30"`, `"750s"`, or milliseconds as a number (`750000`). |
@@ -211,13 +240,84 @@ expensive fast on long videos.
 An explicit `mode` is honoured, except that `detail: "hoch"` always requires
 `static`. Any such override is reported in the answer under "Hinweise" (notes).
 
+## How Instagram works differently
+
+For YouTube, the video URL is handed to Gemini directly and Google fetches the
+video itself. Gemini cannot do that for Instagram, so the server takes a detour:
+
+1. `yt-dlp` downloads the video to a temporary directory
+2. the file is uploaded to the Gemini Files API
+3. the server waits until Google reports the file as `ACTIVE` — analysing it
+   earlier fails
+4. the analysis runs as usual
+5. the uploaded file is deleted at Google and the temporary file is removed,
+   including when a step in between fails
+
+What this means in practice:
+
+- **It is slower.** A short reel takes a few seconds to download and several
+  more to upload and process, before the analysis even starts. The YouTube path
+  has none of that overhead.
+- **It needs yt-dlp.** YouTube does not.
+- **Public posts only.** The server holds no cookies, no session and no login,
+  by design. Private accounts, stories and anything behind a login are out of
+  scope and are reported as such, not worked around.
+- **Video posts only.** Image posts and image carousels are rejected with a
+  clear message rather than a silent failure.
+- **Instagram support in yt-dlp can break.** Instagram changes its delivery
+  paths regularly and actively works against downloaders, so extraction that
+  works today may fail after a site change. A `yt-dlp -U` usually picks up the
+  fix. The server says so in the error message instead of reporting a generic
+  failure.
+- Downloads are capped at `MAX_VIDEO_MB` (250 MB by default), enforced both by
+  yt-dlp during the download and by the server before the upload.
+- Cleanup runs even when a step fails, but it cannot run if the process is
+  killed outright. Should that happen, uploaded files expire at Google after
+  48 hours on their own.
+
+TikTok is deliberately not supported, even though yt-dlp could handle it.
+
+## Model fallback chain
+
+The free tier's daily limit applies **per model**, so an exhausted model does
+not mean the API is unusable. When a request comes back with HTTP 429 (quota
+exhausted) or 503 (model overloaded), the server retries the identical request
+against the next model in the chain instead of surfacing an error.
+
+Default chain, all of which support agentic video processing:
+
+1. `gemini-3.8-flash`
+2. `gemini-3.7-flash`
+3. `gemini-3.6-flash`
+4. `gemini-3.5-flash-lite`
+
+Rules:
+
+- **Only 429 and 503 trigger a switch.** An invalid key, a private video or a
+  malformed argument fails the same way on every model, so retrying would just
+  burn quota. Those errors are reported immediately.
+- **Each model is tried at most once.** When the whole chain is exhausted, the
+  error says so and points out that the quota resets daily.
+- **The switch is never silent.** The answer always names the model that
+  responded, and when a fallback was used, the notes say which models were
+  skipped and why.
+- **For Instagram the file is uploaded once.** The fallback reuses the same
+  uploaded file reference, so a model switch costs no extra upload.
+
+Set `GEMINI_MODEL` to choose the starting model — it always stays first in the
+chain. Set `GEMINI_MODEL_FALLBACKS` to a comma-separated list to replace the
+models tried after it.
+
 ## Limits and cost
 
 - **Public videos only.** Private, unlisted, deleted or region-blocked videos
-  fail.
-- **Free tier: 20 requests per day** for `gemini-3.8-flash`. This is the limit
-  you will actually hit — not the frequently cited 8 hours of YouTube footage
-  per day. Both are reported as HTTP 429.
+  fail. For Instagram this also covers private accounts and stories.
+- **Instagram costs extra time, not extra Gemini quota.** The download and the
+  file upload do not consume analysis tokens, but they do add wall-clock time.
+- **Free tier: 20 requests per day, *per model*** — not per account, and not
+  the frequently cited 8 hours of YouTube footage per day. Because the limit is
+  per model, the server falls back through a chain of models automatically (see
+  below), so the practical ceiling is a multiple of 20 requests per day.
 - **Token cost in static mode** is about 100 tokens per video second at `low`
   and about 300 at `high`. Agentic mode does not scale this way; the
   measurements above are representative.
@@ -265,11 +365,14 @@ the error path.
 | File | Purpose |
 |---|---|
 | `src/index.js` | MCP server, stdio transport, tool registration |
-| `src/analyze.js` | Input validation, mode selection, result formatting |
+| `src/analyze.js` | Input validation, mode selection, orchestration, result formatting |
 | `src/gemini.js` | Wrapper around `@google/genai` → `interactions`, error translation |
+| `src/quelle.js` | Platform detection, YouTube vs Instagram vs rejected |
+| `src/ytdlp.js` | Instagram download via yt-dlp, error translation |
+| `src/files.js` | Gemini Files API: upload, wait for `ACTIVE`, delete |
 | `src/prompt.js` | Default prompt and time-range addendum |
 | `src/time.js` | Time parsing, normalisation to seconds |
-| `src/youtube.js` | URL validation |
+| `src/youtube.js` | YouTube URL validation |
 
 `src/analyze.js` has no MCP dependencies and can be exercised directly from a
 Node script.
@@ -279,8 +382,13 @@ Node script.
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `GEMINI_API_KEY` | yes | — | Key from Google AI Studio |
-| `GEMINI_MODEL` | no | `gemini-3.8-flash` | Model to use |
-| `GEMINI_TIMEOUT_MS` | no | `600000` | Request timeout in milliseconds |
+| `GEMINI_MODEL` | no | `gemini-3.8-flash` | Starting model, always first in the fallback chain |
+| `GEMINI_MODEL_FALLBACKS` | no | see chain above | Comma-separated models to fall back to on HTTP 429 or 503 |
+| `GEMINI_TIMEOUT_MS` | no | `600000` | Timeout for the analysis request, in milliseconds |
+| `YTDLP_PATH` | no | `yt-dlp` from `PATH` | Full path to the yt-dlp executable (Instagram only) |
+| `YTDLP_TIMEOUT_MS` | no | `300000` | Timeout for the Instagram download |
+| `UPLOAD_TIMEOUT_MS` | no | `300000` | How long to wait for Gemini to process an uploaded file |
+| `MAX_VIDEO_MB` | no | `250` | Size ceiling for a downloaded Instagram video |
 
 ## License
 

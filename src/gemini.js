@@ -12,6 +12,21 @@ import { GoogleGenAI } from '@google/genai';
 export const DEFAULT_MODELL = 'gemini-3.8-flash';
 export const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 
+/**
+ * Ausweichkette. Das Tageskontingent des Free Tier gilt pro Modell, nicht pro
+ * Konto -- ein erschoepftes Modell bedeutet also nicht, dass gar nichts mehr
+ * geht. Alle Eintraege beherrschen die agentische Videoverarbeitung.
+ */
+export const DEFAULT_KETTE = [
+  'gemini-3.8-flash',
+  'gemini-3.7-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite',
+];
+
+/** Nur diese Zustaende rechtfertigen einen Modellwechsel. */
+const AUSWEICH_STATUS = new Set([429, 503]);
+
 let clientCache = null;
 
 /** Liefert den Gemini-Client. Wirft eine klare Meldung, wenn der Key fehlt. */
@@ -39,47 +54,116 @@ export function resetClient() {
  * Schickt ein Video plus Frage an den interactions-Endpoint.
  *
  * @param {object} p
- * @param {string} p.url        Normalisierte YouTube-URL.
+ * @param {string} p.url        YouTube-URL oder URI einer hochgeladenen Datei.
  * @param {string} p.prompt     Die Frage an das Modell.
  * @param {'agentic'|object} p.processing  "agentic" oder {type:'static',...}.
  * @param {string} [p.resolution]  "low" | "medium" | "high" | "ultra_high".
+ * @param {string} [p.mimeTyp]  Nur fuer hochgeladene Dateien noetig.
  * @param {string} [p.modell]
  * @param {number} [p.timeoutMs]
  * @returns {Promise<{text: string, tokens: number|null, status: string, modell: string, usage: object}>}
  */
-export async function frageVideo({ url, prompt, processing, resolution, modell, timeoutMs }) {
+export async function frageVideo({ url, prompt, processing, resolution, mimeTyp, modell, timeoutMs }) {
   const client = holeClient();
-  const modellName = modell || process.env.GEMINI_MODEL?.trim() || DEFAULT_MODELL;
+  const kette = modellKette(modell);
 
   const video = { type: 'video', uri: url, processing };
   if (resolution) video.resolution = resolution;
+  // Nur der Instagram-Pfad setzt das. Ohne mimeTyp bleibt die Anfrage exakt
+  // die, die der YouTube-Pfad schon immer geschickt hat.
+  if (mimeTyp) video.mime_type = mimeTyp;
 
-  let antwort;
-  try {
-    antwort = await client.interactions.create(
-      { model: modellName, input: [video, { type: 'text', text: prompt }] },
-      { timeout_ms: timeoutMs ?? DEFAULT_TIMEOUT_MS },
-    );
-  } catch (fehler) {
-    throw uebersetzeFehler(fehler, url, await pruefeKey(client, fehler));
+  const eingabe = [video, { type: 'text', text: prompt }];
+  const uebersprungen = [];
+
+  for (let i = 0; i < kette.length; i += 1) {
+    const modellName = kette[i];
+    const letztes = i === kette.length - 1;
+
+    let antwort;
+    try {
+      antwort = await client.interactions.create(
+        { model: modellName, input: eingabe },
+        {
+          timeout_ms: timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          // Die SDK-eigenen Wiederholungen muessen aus: sie probieren jedes
+          // Modell mehrfach, bevor die Kette ueberhaupt weiterschaltet. Bei
+          // einem erschoepften Tageskontingent ist das reine Zeit- und
+          // Kontingentverschwendung -- das Ausweichen auf das naechste Modell
+          // ist die richtige Antwort, nicht ein erneuter Versuch beim selben.
+          retries: { strategy: 'none' },
+        },
+      );
+    } catch (fehler) {
+      const status = statusVon(fehler);
+
+      // Nur Kontingent und Ueberlastung rechtfertigen einen Wechsel. Ein
+      // kaputter Key oder ein privates Video wuerde bei jedem Modell genauso
+      // scheitern -- weiterzuprobieren wuerde nur Kontingent verbrennen.
+      if (AUSWEICH_STATUS.has(status) && !letztes) {
+        uebersprungen.push({ modell: modellName, status });
+        continue;
+      }
+      if (AUSWEICH_STATUS.has(status) && uebersprungen.length) {
+        uebersprungen.push({ modell: modellName, status });
+        throw ketteErschoepft(uebersprungen);
+      }
+      throw uebersetzeFehler(fehler, url, await pruefeKey(client, fehler));
+    }
+
+    const text = leseAntworttext(antwort);
+    if (!text) {
+      throw new FehlerGemini(
+        `Die API hat geantwortet (Status "${antwort?.status ?? 'unbekannt'}"), aber keinen auswertbaren ` +
+          'Text geliefert. Versuche es mit einer konkreteren Frage oder einem kuerzeren Ausschnitt.',
+        'leere_antwort',
+      );
+    }
+
+    return {
+      text,
+      tokens: typeof antwort?.usage?.total_tokens === 'number' ? antwort.usage.total_tokens : null,
+      status: antwort?.status ?? 'unbekannt',
+      modell: antwort?.model ?? modellName,
+      usage: antwort?.usage ?? {},
+      uebersprungen,
+    };
   }
 
-  const text = leseAntworttext(antwort);
-  if (!text) {
-    throw new FehlerGemini(
-      `Die API hat geantwortet (Status "${antwort?.status ?? 'unbekannt'}"), aber keinen auswertbaren ` +
-        'Text geliefert. Versuche es mit einer konkreteren Frage oder einem kuerzeren Ausschnitt.',
-      'leere_antwort',
-    );
-  }
+  throw ketteErschoepft(uebersprungen);
+}
 
-  return {
-    text,
-    tokens: typeof antwort?.usage?.total_tokens === 'number' ? antwort.usage.total_tokens : null,
-    status: antwort?.status ?? 'unbekannt',
-    modell: antwort?.model ?? modellName,
-    usage: antwort?.usage ?? {},
-  };
+/**
+ * Baut die Modellkette: Startmodell zuerst, dann die Ausweichmodelle.
+ *
+ * Ein ausdruecklich gesetztes GEMINI_MODEL bleibt immer der erste Eintrag und
+ * behaelt damit seine bisherige Bedeutung. Doppelte Eintraege fliegen raus,
+ * damit kein Modell zweimal probiert wird.
+ */
+export function modellKette(modell) {
+  const start = modell || process.env.GEMINI_MODEL?.trim() || DEFAULT_KETTE[0] || DEFAULT_MODELL;
+
+  const roh = process.env.GEMINI_MODEL_FALLBACKS?.trim();
+  const ausweich = roh
+    ? roh.split(',').map((m) => m.trim()).filter(Boolean)
+    : DEFAULT_KETTE;
+
+  return [...new Set([start, ...ausweich])];
+}
+
+function statusVon(fehler) {
+  return fehler?.status ?? fehler?.statusCode ?? fehler?.response?.status ?? null;
+}
+
+function ketteErschoepft(uebersprungen) {
+  const liste = uebersprungen.map((u) => `${u.modell} (HTTP ${u.status})`).join(', ');
+  return new FehlerGemini(
+    `Alle verfuegbaren Modelle sind erschoepft oder ueberlastet: ${liste}. Das Tageskontingent des ` +
+      'Free Tier gilt pro Modell und wird taeglich zurueckgesetzt -- morgen geht es also wieder. ' +
+      'Zusaetzliche Modelle lassen sich ueber GEMINI_MODEL_FALLBACKS eintragen, alternativ hilft ' +
+      'ein hoeheres Kontingent (ai.dev/rate-limit).',
+    'kette_erschoepft',
+  );
 }
 
 /**
@@ -200,8 +284,10 @@ export function uebersetzeFehler(fehler, url, keyGueltig = null) {
     klein.includes('rate limit')
   ) {
     return new FehlerGemini(
-      'Kontingent erschoepft (HTTP 429). Im Free Tier sind maximal 8 Stunden YouTube-Material pro Tag ' +
-        'erlaubt, dazu kommen Limits pro Minute. Warte ab oder nutze einen kuerzeren Ausschnitt.',
+      'Kontingent erschoepft (HTTP 429). Im Free Tier gilt das Tageslimit pro Modell -- fuer ' +
+        'gemini-3.8-flash sind es 20 Anfragen pro Tag. Es wird taeglich zurueckgesetzt. Ueber ' +
+        'GEMINI_MODEL_FALLBACKS lassen sich weitere Modelle eintragen, auf die automatisch ' +
+        'ausgewichen wird.',
       'kontingent',
       fehler,
     );
