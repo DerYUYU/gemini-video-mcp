@@ -1,188 +1,287 @@
 # gemini-video-mcp
 
-MCP-Server, der öffentliche YouTube-Videos über die Google-Gemini-API analysiert.
-Bild- und Tonspur werden gemeinsam ausgewertet — ein separates Transkript ist nicht nötig.
+An MCP server that lets Claude — or any other MCP client — understand public
+YouTube videos, both what is said and what is shown, through the Google Gemini
+API. It exposes a single tool, `analyze_video`, over stdio.
 
-Der Server spricht **stdio** und stellt genau ein Tool bereit: `analyze_video`.
-Kein HTTP, kein Gateway, kein Token, kein systemd.
+## Why
 
-## Warum das wichtig ist: zwei Endpunkte, ein großer Unterschied
+Language models cannot watch YouTube videos. The usual workaround is to paste a
+transcript by hand, which throws away everything that only appears on screen, or
+to ask a second app and copy the answer back. This server removes that detour:
+the client asks a question about a URL and gets an answer grounded in the audio
+*and* the video track.
 
-Gemini kann YouTube-Videos auf zwei Wegen verarbeiten. Dieser Server nutzt
-konsequent den zweiten:
+## What it does
 
-| | `models:generateContent` | `POST /v1beta/interactions` (agentic) |
+- Full analysis with chapters and timestamps across the whole video
+- Targeted analysis of a specific time range
+- Audio and visuals evaluated together — on-screen text, code, diagrams and
+  demos are part of the answer, no separate transcript needed
+- Token usage reported on every call, so the cost of each request is visible
+
+## The agentic finding
+
+This is why the project exists rather than just calling `generateContent`.
+
+Gemini can process YouTube videos two ways. The classic endpoint,
+`models:generateContent`, pulls the video into the context window frame by
+frame. The `POST /v1beta/interactions` endpoint in agentic mode lets the model
+navigate the video itself.
+
+Same 15-minute video, same question:
+
+| | `models:generateContent` | `interactions` (agentic) |
 |---|---|---|
-| Vorgehen | Video Frame für Frame ins Kontextfenster | Das Modell navigiert selbst durchs Video |
-| 15-Minuten-Video | **85.480 Tokens** | **7.416 Tokens** |
-| Antwortqualität | unvollständig | vollständiger |
+| Tokens | **85,480** | **7,416** |
+| Answer | incomplete | more complete coverage |
 
-Das sind **rund 91 % weniger Tokens bei besserer Qualität**. Deshalb geht hier
-alles über `interactions`. Das Feld `processing`, über das die Betriebsart
-gewählt wird, existiert in `generateContent` ohnehin nicht — ein Versuch dort
-quittiert die API mit `400 INVALID_ARGUMENT: Unknown name "processing"`.
+Roughly **91 % fewer tokens, with better coverage**. This server therefore uses
+`interactions` throughout. The `processing` field that selects the mode does not
+exist on `generateContent` at all — sending it there returns
+`400 INVALID_ARGUMENT: Unknown name "processing"`.
 
-Eigene Messungen dieses Servers am Video `b3WiM0o3bF8` (15 min):
+Measurements taken with this server on a 15-minute video:
 
-| Aufruf | Modus | Tokens |
+| Call | Mode | Tokens |
 |---|---|---|
-| Ganzes Video, gezielte Frage | agentic | 8.203 |
-| Ausschnitt 10:30–12:30 | static, `low` | 11.293 |
-| Ausschnitt 10:30–12:30 | static, `high` | 35.922 |
+| Whole video, specific question | agentic | 8,203 |
+| Range 10:30–12:30 | static, `low` | 11,293 |
+| Range 10:30–12:30 | static, `high` | 35,922 |
 
-Bemerkenswert: `low` fand im Ausschnitt denselben nur im Bild sichtbaren
-GitHub-Repository-Namen wie `high` — für ein Drittel der Kosten. Deshalb bleibt
-die hohe Auflösung eine bewusste Entscheidung (`detail: "hoch"`) statt ein
-Automatismus.
+Worth noting: `low` picked up the same on-screen-only GitHub repository name
+that `high` did, for a third of the cost. High resolution is therefore a
+deliberate choice (`detail: "hoch"`), never automatic.
+
+## Requirements
+
+- **Node 22 or newer** (developed and tested on 24.16)
+- **Your own Gemini API key** from [Google AI Studio](https://aistudio.google.com/apikey)
 
 ## Installation
 
-Voraussetzung: **Node ≥ 22** (entwickelt und getestet mit 24.16).
-
 ```bash
+git clone https://github.com/DerYUYU/gemini-video-mcp.git
+cd gemini-video-mcp
 npm install
 ```
 
-## Konfiguration
-
-Der API-Key kommt aus einer `.env` im Projektverzeichnis (Vorlage:
-`.env.example`) oder aus der Umgebung der MCP-Konfiguration.
+Create a `.env` file next to `package.json` (see `.env.example`):
 
 ```ini
-# Pflicht: Key aus Google AI Studio
-GEMINI_API_KEY=dein-key
-
-# Optional, Default gemini-3.8-flash
-GEMINI_MODEL=gemini-3.8-flash
-
-# Optional, Timeout in Millisekunden. Default 600000 (10 Minuten).
-GEMINI_TIMEOUT_MS=600000
+GEMINI_API_KEY=your-key-here
 ```
 
-`.env` ist in `.gitignore` und gehört niemals ins Repository.
+`.env` is gitignored and must never be committed.
 
-### Registrierung beim MCP-Client
+### Register with your MCP client
+
+For Claude Code:
 
 ```bash
-claude mcp add gemini-video -- node /absoluter/pfad/zu/gemini-video-mcp/src/index.js
+claude mcp add gemini-video -- node /path/to/gemini-video-mcp/src/index.js
 ```
 
-Oder direkt in der Client-Konfiguration:
+For clients that use a configuration file (Claude Desktop and others):
 
 ```json
 {
   "mcpServers": {
     "gemini-video": {
       "command": "node",
-      "args": ["/absoluter/pfad/zu/gemini-video-mcp/src/index.js"]
+      "args": ["/path/to/gemini-video-mcp/src/index.js"]
     }
   }
 }
 ```
 
-Der Key kann alternativ hier als `"env": { "GEMINI_API_KEY": "..." }` gesetzt
-werden, statt über `.env`.
+Replace `/path/to/gemini-video-mcp` with the absolute path to your clone. The
+key can also be passed here instead of via `.env`:
 
-## Tool: `analyze_video`
-
-| Parameter | Typ | Pflicht | Default | Bedeutung |
-|---|---|---|---|---|
-| `url` | string | ja | — | URL eines **öffentlichen** YouTube-Videos. Akzeptiert `watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`. |
-| `prompt` | string | nein | Vollanalyse | Die Frage an das Video. Ohne Angabe wird eine strukturierte Komplettanalyse angefordert (siehe unten). |
-| `mode` | `agentic` \| `static` \| `auto` | nein | `auto` | Betriebsart, siehe nächster Abschnitt. |
-| `start` | string \| number | nein | — | Beginn eines Ausschnitts. `"12:30"`, `"1:02:30"`, `"750s"` oder Millisekunden als Zahl (`750000`). |
-| `end` | string \| number | nein | — | Ende des Ausschnitts, gleiche Formate. |
-| `detail` | `normal` \| `hoch` | nein | `normal` | `hoch` erzwingt `static` mit hoher Auflösung (~300 statt ~100 Tokens pro Videosekunde). |
-
-Die Antwort nennt immer **Modus, Auflösung, Ausschnitt, Modell und den
-verbrauchten Tokenwert**, damit die Kosten jedes Aufrufs sichtbar sind.
-
-### Der Default-Prompt
-
-Ohne eigenen `prompt` fordert der Server eine Analyse in fünf Teilen an:
-Kurzfassung, Kapitel mit Zeitstempeln über das gesamte Video, wichtigste
-Aussagen mit Zeitstempeln, ausdrücklich das **visuell Gezeigte** (Bildschirm-
-inhalte, Code, Hardware, Einblendungen) und ein Fazit. Der Hinweis auf die
-Bildspur steht bewusst drin: ohne ihn fällt das Modell häufig auf eine reine
-Transkript-Zusammenfassung zurück.
-
-### Die beiden Modi
-
-**`agentic`** — das Modell sucht sich selbst die relevanten Stellen im Video.
-Kennt keine harten Zeit-Offsets. Die erste Wahl für ganze Videos und für jede
-inhaltliche Frage.
-
-**`static`** — das Video wird Sekunde für Sekunde verarbeitet. Erlaubt exaktes
-Zuschneiden über `start`/`end` sowie die hohe Auflösung, kostet aber ~100
-(`low`) bis ~300 (`high`) Tokens pro Videosekunde. Ohne Ausschnitt wird das bei
-langen Videos sehr teuer.
-
-**`auto`** (Default) entscheidet so:
-
-| Situation | Ergebnis |
-|---|---|
-| `detail: "hoch"` | `static`, Auflösung `high` |
-| Ausschnitt ≤ 5 Minuten | `static`, Auflösung `low` |
-| Ausschnitt > 5 Minuten | `agentic` (der Bereich steht im Prompt) |
-| kein Ausschnitt | `agentic` |
-
-Wird `mode` ausdrücklich gesetzt, gilt das — außer `detail: "hoch"` verlangt
-zwingend `static`. Solche Übersteuerungen meldet die Antwort unter „Hinweise".
-
-### Beispiele
-
-```jsonc
-// Komplette Analyse eines Videos, günstigster Weg
-{ "url": "https://www.youtube.com/watch?v=VIDEOID" }
-
-// Gezielte Frage
-{ "url": "https://youtu.be/VIDEOID",
-  "prompt": "Welche Werkzeuge empfiehlt der Sprecher? Mit Zeitstempeln." }
-
-// Ausschnitt exakt zuschneiden -> auto wählt static/low
-{ "url": "https://www.youtube.com/watch?v=VIDEOID",
-  "start": "10:30", "end": "12:30",
-  "prompt": "Was steht in diesem Abschnitt auf dem Bildschirm?" }
-
-// Feine Bilddetails, teuer -> nur mit kurzem Ausschnitt sinnvoll
-{ "url": "https://www.youtube.com/watch?v=VIDEOID",
-  "start": "14:00", "end": "14:40", "detail": "hoch",
-  "prompt": "Lies den Code im Terminal Zeile für Zeile vor." }
+```json
+{
+  "mcpServers": {
+    "gemini-video": {
+      "command": "node",
+      "args": ["/path/to/gemini-video-mcp/src/index.js"],
+      "env": { "GEMINI_API_KEY": "your-key-here" }
+    }
+  }
+}
 ```
 
-## Bekannte Grenzen
+## Usage
 
-- **Nur öffentliche Videos.** Private, nicht gelistete, gelöschte oder regional
-  gesperrte Videos schlagen fehl. Die API meldet das als `403 The caller does
-  not have permission`, ohne das Video zu erwähnen; der Server prüft in diesem
-  Fall den Key aktiv gegen und formuliert die Ursache entsprechend.
-- **Free Tier: maximal 8 Stunden YouTube-Material pro Tag**, dazu Limits pro
-  Minute. Beides quittiert die API mit HTTP 429.
-- **Lange Videos brauchen Zeit.** Im agentic-Modus sind mehrere Minuten normal.
-  Default-Timeout 10 Minuten, anpassbar über `GEMINI_TIMEOUT_MS`.
-- **Keine Bild- oder PDF-Analyse.** Der Server macht ausschließlich Video.
-- **`start`/`end` wirken nur im statischen Modus.** Im agentic-Modus wird der
-  gewünschte Bereich in den Prompt geschrieben, aber nicht hart zugeschnitten.
-- Zeitstempel stammen vom Modell und können um einige Sekunden abweichen.
+The client calls the tool; you normally just ask in plain language. The
+arguments below are what the tool receives.
 
-## Fehlermeldungen
+**A simple question about a video**
 
-Der Server gibt nie einen rohen Stacktrace zurück, sondern eine erklärte
-Ursache: fehlender Key, abgelehnter Key, nicht abrufbares Video, erschöpftes
-Kontingent, Zeitüberschreitung, Netzwerkproblem, Serverfehler, ungültige
-Eingabe. Der API-Key wird dabei grundsätzlich nicht ausgegeben — auch nicht
-teilweise.
+```jsonc
+{
+  "url": "https://www.youtube.com/watch?v=VIDEO_ID",
+  "prompt": "Which tools does the speaker recommend? Include timestamps."
+}
+```
 
-## Projektstruktur
+**Analysing a specific range** — `auto` switches to the static mode here and
+cuts exactly to the requested window:
 
-| Datei | Aufgabe |
+```jsonc
+{
+  "url": "https://www.youtube.com/watch?v=VIDEO_ID",
+  "start": "10:30",
+  "end": "12:30",
+  "prompt": "What is shown on screen during this part?"
+}
+```
+
+**Higher visual detail** — roughly three times the tokens per video second, so
+only worth it on a short range:
+
+```jsonc
+{
+  "url": "https://www.youtube.com/watch?v=VIDEO_ID",
+  "start": "14:00",
+  "end": "14:40",
+  "detail": "hoch",
+  "prompt": "Read the code in the terminal line by line."
+}
+```
+
+**Leaving out `prompt`** requests a full structured analysis: summary, chapters
+with timestamps covering the entire video, key statements, what is shown
+visually, and a closing assessment.
+
+### Example output
+
+Every answer starts with a header stating mode, resolution, range, model and
+token usage. Abbreviated real output from a question about a speaker's Linux
+setup:
+
+```markdown
+**Video:** https://www.youtube.com/watch?v=VIDEO_ID
+**Modus:** agentic
+**Tokenverbrauch:** 8.203 Tokens
+**Modell:** gemini-3.8-flash
+
+---
+
+* **Distribution [ca. 10:45 – 10:57]:**
+  Er nutzt das aktuelle **CachyOS**, eine auf **Arch Linux** basierende
+  Distribution [...]
+
+* **Fingerabdrucksensor [ca. 14:27 – 15:02]:** Der Sensor wird unter Linux zwar
+  prinzipiell unterstützt, ist im Alltag jedoch extrem unzuverlässig [...]
+```
+
+See [Response language](#response-language) for why this example is in German.
+
+## Tool reference: `analyze_video`
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `url` | string | yes | — | URL of a **public** YouTube video. Accepts `watch?v=`, `youtu.be/`, `/shorts/`, `/live/` and `/embed/` forms. |
+| `prompt` | string | no | full analysis | The question to ask. Omitted, a complete structured analysis with chapters and timestamps is requested. |
+| `mode` | `agentic` \| `static` \| `auto` | no | `auto` | Processing mode, see below. |
+| `start` | string \| number | no | — | Start of a range: `"12:30"`, `"1:02:30"`, `"750s"`, or milliseconds as a number (`750000`). |
+| `end` | string \| number | no | — | End of the range, same formats. |
+| `detail` | `normal` \| `hoch` | no | `normal` | `hoch` ("high") forces the static mode at high resolution, roughly 300 instead of 100 tokens per video second. |
+
+### Modes
+
+**`agentic`** — the model navigates the video itself and picks the relevant
+passages. It has no hard time offsets. The right choice for whole videos and for
+any question about content.
+
+**`static`** — the video is processed second by second. This allows exact
+trimming via `start`/`end` and the high resolution setting, but costs roughly
+100 (`low`) to 300 (`high`) tokens per video second. Without a range it gets
+expensive fast on long videos.
+
+**`auto`** (default) decides as follows:
+
+| Situation | Result |
 |---|---|
-| `src/index.js` | MCP-Server, stdio-Transport, Tool-Registrierung |
-| `src/analyze.js` | Eingabeprüfung, Moduswahl, Ergebnisformatierung |
-| `src/gemini.js` | Wrapper um `@google/genai` → `interactions`, Fehlerübersetzung |
-| `src/prompt.js` | Default-Prompt und Zeitrahmen-Zusatz |
-| `src/time.js` | Zeitparsing, Normalisierung auf Sekunden |
-| `src/youtube.js` | URL-Validierung |
+| `detail: "hoch"` | `static`, resolution `high` |
+| Range of 5 minutes or less | `static`, resolution `low` |
+| Range longer than 5 minutes | `agentic`, with the range stated in the prompt |
+| No range | `agentic` |
 
-`src/analyze.js` ist bewusst frei von MCP-Abhängigkeiten und lässt sich direkt
-per Node-Skript testen.
+An explicit `mode` is honoured, except that `detail: "hoch"` always requires
+`static`. Any such override is reported in the answer under "Hinweise" (notes).
+
+## Limits and cost
+
+- **Public videos only.** Private, unlisted, deleted or region-blocked videos
+  fail.
+- **Free tier: 20 requests per day** for `gemini-3.8-flash`. This is the limit
+  you will actually hit — not the frequently cited 8 hours of YouTube footage
+  per day. Both are reported as HTTP 429.
+- **Token cost in static mode** is about 100 tokens per video second at `low`
+  and about 300 at `high`. Agentic mode does not scale this way; the
+  measurements above are representative.
+- **An API key bills separately** from any Google AI subscription. A paid
+  Gemini app plan does not cover API usage.
+- **Long videos take time.** Several minutes is normal in agentic mode. The
+  default timeout is 10 minutes, adjustable via `GEMINI_TIMEOUT_MS`.
+- **`start`/`end` only take effect in static mode.** In agentic mode the
+  requested range is written into the prompt but not hard-trimmed.
+- Timestamps come from the model and can be off by a few seconds.
+- Video only. No image or PDF tooling.
+
+## Response language
+
+The model answers in the language of the question you ask. The default prompt
+and the tool's own output labels and notes ship in German, so a call without an
+explicit `prompt` returns a German analysis — as in the example above. Pass your
+own `prompt` in English to get an English answer.
+
+## Three deviations from Google's documentation
+
+All three were verified against the live API and cost real debugging time. If
+you are building against this API yourself, they are worth knowing.
+
+**1. Time offsets are second-strings, not millisecond numbers.**
+`processing.start_offset` and `end_offset` accept only strings with an `s`
+suffix, such as `"630s"`. Passing raw milliseconds returns
+`400 Invalid input at 'input[0].processing'`. This server accepts `"12:30"`,
+`"750s"` and milliseconds from the caller and converts internally.
+
+**2. The field is `resolution`, not `media_resolution`.**
+`media_resolution` is the `generateContent` name. On the `interactions`
+endpoint the setting sits directly on the video input as `resolution`.
+
+**3. The two most common errors are signalled the wrong way round.**
+An unreachable video returns `403 The caller does not have permission` — with no
+mention of the video at all. An invalid API key returns `400` with an *empty*
+message body. Classifying these by their text alone reports a private video as a
+key problem. This server resolves the ambiguity by issuing a `models.list` call
+with the same key, which takes about 0.1 s, costs no tokens, and only runs on
+the error path.
+
+## Project layout
+
+| File | Purpose |
+|---|---|
+| `src/index.js` | MCP server, stdio transport, tool registration |
+| `src/analyze.js` | Input validation, mode selection, result formatting |
+| `src/gemini.js` | Wrapper around `@google/genai` → `interactions`, error translation |
+| `src/prompt.js` | Default prompt and time-range addendum |
+| `src/time.js` | Time parsing, normalisation to seconds |
+| `src/youtube.js` | URL validation |
+
+`src/analyze.js` has no MCP dependencies and can be exercised directly from a
+Node script.
+
+## Configuration reference
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `GEMINI_API_KEY` | yes | — | Key from Google AI Studio |
+| `GEMINI_MODEL` | no | `gemini-3.8-flash` | Model to use |
+| `GEMINI_TIMEOUT_MS` | no | `600000` | Request timeout in milliseconds |
+
+## License
+
+MIT — see [LICENSE](LICENSE).
