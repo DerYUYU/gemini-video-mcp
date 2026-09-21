@@ -10,6 +10,7 @@ import { DEFAULT_PROMPT, mitZeitrahmen } from './prompt.js';
 import { frageVideo, DEFAULT_TIMEOUT_MS, FehlerGemini } from './gemini.js';
 import { ladeInstagramVideo, entferneVerzeichnis } from './ytdlp.js';
 import { ladeHoch, loescheDatei } from './files.js';
+import { stelleBereit } from './lokal.js';
 
 /**
  * Bis zu dieser Ausschnittslaenge (Sekunden) schaltet "auto" von agentic auf
@@ -32,10 +33,12 @@ export const DETAILSTUFEN = ['normal', 'hoch'];
  * @param {string|number} [args.start]
  * @param {string|number} [args.end]
  * @param {'normal'|'hoch'} [args.detail]
+ * @param {object} [opt]
+ * @param {(text: string) => void} [opt.melde]  Fortschrittsmeldungen, nur fuer lokale Dateien.
  * @returns {Promise<{text: string, tokens: number|null, meta: object}>}
  */
-export async function analyseVideo(args = {}) {
-  const { url, plattform } = erkenneQuelle(args.url);
+export async function analyseVideo(args = {}, { melde } = {}) {
+  const { url, plattform, datei } = erkenneQuelle(args.url);
 
   const mode = args.mode ?? 'auto';
   if (!MODI.includes(mode)) {
@@ -68,7 +71,9 @@ export async function analyseVideo(args = {}) {
   );
 
   const ergebnis =
-    plattform === 'instagram'
+    plattform === 'lokal'
+      ? await frageLokal({ datei, prompt, plan, melde })
+      : plattform === 'instagram'
       ? await frageInstagram({ url, prompt, plan })
       : await frageVideo({
           url,
@@ -81,6 +86,7 @@ export async function analyseVideo(args = {}) {
   // Ein Modellwechsel darf nicht stillschweigend passieren: der Nutzer soll
   // sehen, dass nicht das angefragte Modell geantwortet hat, und warum.
   const hinweise = [...plan.hinweise];
+  if (ergebnis.bereitstellung) hinweise.push(hinweisLokal(ergebnis.bereitstellung));
   if (ergebnis.uebersprungen?.length) {
     const liste = ergebnis.uebersprungen
       .map((u) => `${u.modell} (${u.status === 429 ? 'Tageskontingent erschoepft' : 'ueberlastet'})`)
@@ -143,6 +149,38 @@ async function frageInstagram({ url, prompt, plan }) {
     if (hochgeladen?.name) await loescheDatei(hochgeladen.name);
     if (download?.verzeichnis) await entferneVerzeichnis(download.verzeichnis);
   }
+}
+
+/**
+ * Lokaler Pfad: hochladen oder vorhandene Kopie wiederverwenden, analysieren.
+ *
+ * Anders als bei Instagram wird hier bewusst NICHT geloescht: Folgefragen zum
+ * selben Video, etwa Kapitel fuer Kapitel, sollen keinen neuen Upload
+ * ausloesen. Loeschen geht gezielt ueber manage_local_video, sonst verfaellt
+ * die Kopie nach 48 Stunden.
+ */
+async function frageLokal({ datei, prompt, plan, melde }) {
+  const bereit = await stelleBereit(datei, melde);
+  melde?.('Datei ist bereit, Analyse laeuft.');
+  const antwort = await frageVideo({
+    url: bereit.uri,
+    mimeTyp: bereit.mimeTyp,
+    prompt,
+    processing: plan.processing,
+    resolution: plan.resolution,
+    timeoutMs: timeoutAusUmgebung(),
+  });
+  return { ...antwort, bereitstellung: bereit };
+}
+
+function hinweisLokal({ wiederverwendet, ablauf }) {
+  const bis = ablauf ? ` Sie liegt bis ${new Date(ablauf).toLocaleString('de-DE')} bei Google.` : '';
+  return (
+    (wiederverwendet
+      ? 'Bereits hochgeladene Kopie wiederverwendet, kein neuer Upload.'
+      : 'Datei wurde zur Gemini Files API hochgeladen und bleibt fuer Folgefragen liegen.') +
+    `${bis} Vorher entfernen: manage_local_video mit action "delete".`
+  );
 }
 
 /**

@@ -1,13 +1,15 @@
 /**
  * Plattformerkennung. Entscheidet, ob eine URL ueber den nativen YouTube-Pfad
  * laeuft (Gemini holt sich das Video selbst) oder ueber den Instagram-Pfad
- * (herunterladen, hochladen, analysieren).
+ * (herunterladen, hochladen, analysieren) oder ob es ein lokaler Dateipfad ist
+ * (hochladen, bei Folgefragen wiederverwenden).
  *
  * Alles andere wird abgelehnt. TikTok ist bewusst nicht dabei, obwohl yt-dlp
  * es koennte.
  */
 
 import { pruefeYoutubeUrl, FehlerUrl } from './youtube.js';
+import { istLokalerPfad, pruefeLokaleDatei } from './lokal.js';
 
 const YOUTUBE_HOSTS = new Set([
   'youtube.com', 'www.youtube.com', 'm.youtube.com',
@@ -32,13 +34,18 @@ const INSTAGRAM_PFADE =
  * Bestimmt Plattform und normalisierte URL.
  *
  * @param {string} eingabe
- * @returns {{plattform: 'youtube'|'instagram', url: string, id: string}}
+ * @returns {{plattform: 'youtube'|'instagram'|'lokal', url: string, id: string, datei?: object}}
  */
 export function erkenneQuelle(eingabe) {
   if (typeof eingabe !== 'string' || eingabe.trim() === '') {
     throw new FehlerUrl('Es wurde keine URL uebergeben.');
   }
   const roh = eingabe.trim();
+
+  // Vor dem URL-Parser: "C:\..." wuerde dort sonst als Protokoll "c:" gelesen.
+  if (istLokalerPfad(roh)) {
+    return { plattform: 'lokal', ...pruefeLokaleDatei(roh) };
+  }
 
   let u;
   try {
@@ -64,8 +71,8 @@ export function erkenneQuelle(eingabe) {
 
   throw new FehlerUrl(
     `"${u.hostname}" wird nicht unterstuetzt. Dieser Server analysiert oeffentliche Videos von ` +
-      'YouTube und Instagram (Reels und Video-Beitraege). Andere Plattformen, auch TikTok, ' +
-      'sind bewusst nicht vorgesehen.',
+      'YouTube und Instagram (Reels und Video-Beitraege) sowie eigene Videodateien per ' +
+      'vollstaendigem lokalem Pfad. Andere Plattformen, auch TikTok, sind bewusst nicht vorgesehen.',
   );
 }
 
