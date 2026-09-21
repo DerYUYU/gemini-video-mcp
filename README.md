@@ -1,8 +1,10 @@
 # gemini-video-mcp
 
 An MCP server that lets Claude — or any other MCP client — understand public
-YouTube and Instagram videos, both what is said and what is shown, through the
-Google Gemini API. It exposes a single tool, `analyze_video`, over stdio.
+YouTube and Instagram videos as well as your own local video files, both what
+is said and what is shown, through the Google Gemini API. It exposes
+`analyze_video` over stdio, plus `manage_local_video` for the upload of local
+files.
 
 ## Why
 
@@ -16,6 +18,8 @@ reel; the difference in how they are fetched is handled internally.
 ## What it does
 
 - YouTube videos and Instagram reels and video posts
+- Your own video files by local path, uploaded once and reused for follow-up
+  questions
 - Full analysis with chapters and timestamps across the whole video
 - Targeted analysis of a specific time range
 - Audio and visuals evaluated together — on-screen text, code, diagrams and
@@ -210,7 +214,7 @@ See [Response language](#response-language) for why this example is in German.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `url` | string | yes | — | URL of a **public** video. YouTube: `watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`. Instagram: `/reel/`, `/reels/`, `/p/`, `/tv/` and `/share/` links. No other platform. |
+| `url` | string | yes | — | URL of a **public** video. YouTube: `watch?v=`, `youtu.be/`, `/shorts/`, `/live/`, `/embed/`. Instagram: `/reel/`, `/reels/`, `/p/`, `/tv/` and `/share/` links. Or the absolute path of a local video file, e.g. `C:\Users\Name\Videos\talk.mp4`, see [Local video files](#local-video-files). No other platform. |
 | `prompt` | string | no | full analysis | The question to ask. Omitted, a complete structured analysis with chapters and timestamps is requested. |
 | `mode` | `agentic` \| `static` \| `auto` | no | `auto` | Processing mode, see below. |
 | `start` | string \| number | no | — | Start of a range: `"12:30"`, `"1:02:30"`, `"750s"`, or milliseconds as a number (`750000`). |
@@ -239,6 +243,13 @@ expensive fast on long videos.
 
 An explicit `mode` is honoured, except that `detail: "hoch"` always requires
 `static`. Any such override is reported in the answer under "Hinweise" (notes).
+
+## Tool reference: `manage_local_video`
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `action` | `upload` \| `status` \| `delete` | yes | `upload` uploads the file and waits for `ACTIVE`, reusing an existing copy of the unchanged file. `status` lists the copies at Google with their expiry. `delete` removes every copy of this path at Google. |
+| `path` | string | yes | Absolute path of the local video file. For `status` and `delete` the file itself no longer needs to exist. |
 
 ## How Instagram works differently
 
@@ -276,6 +287,83 @@ What this means in practice:
   48 hours on their own.
 
 TikTok is deliberately not supported, even though yt-dlp could handle it.
+
+## Local video files
+
+Pass an absolute path instead of a URL. Windows paths with backslashes and a
+drive letter work, forward slashes too, and surrounding quotes from Explorer's
+"Copy as path" are stripped.
+
+Before anything is uploaded the server checks that the file exists, that its
+extension is one Gemini supports (`.mp4`, `.mpeg`, `.mpg`, `.mov`, `.avi`,
+`.flv`, `.webm`, `.wmv`, `.3gp`) and that it is not larger than 2 GB. The Files
+API documentation states 2 GB per file; the video documentation says 2 GB on the
+free tier and 20 GB on paid tiers. The server defaults to the smaller figure,
+counted in decimal gigabytes (2,000,000,000 bytes). `LOKAL_MAX_MB` raises it if
+your tier allows more.
+
+Unlike Instagram, the uploaded copy is **not** deleted after the answer. Uploading
+a 1.7 GB file again for every question would be absurd. Instead:
+
+- The copy is tagged at Google with a hash of path, size and modification time.
+  A later call with the same, unchanged file reuses it, even after a server
+  restart. The path itself never leaves your machine.
+- If the file has changed, it is uploaded again and older copies of the same
+  path are deleted.
+- The Files API keeps files for 48 hours. A copy with less than an hour left is
+  not used any more; the file is uploaded again.
+- Two calls for the same file at the same time share one upload.
+- `manage_local_video` with `action: "delete"` removes all copies of a path at
+  Google right away. `action: "status"` shows whether and until when a copy
+  exists. The local file is never touched.
+
+### Long videos
+
+A 45-minute file of 1.7 GB takes a while to upload, depending on your upload
+bandwidth, and Google then needs time to process it. The server waits up to
+30 minutes for the processing (`LOKAL_UPLOAD_TIMEOUT_MS`); if it does not finish,
+the copy is deleted. The recommended flow:
+
+1. `manage_local_video` with `action: "upload"` and the path. This only uploads
+   and waits for `ACTIVE`; nothing is analysed yet.
+2. `analyze_video` with the path and no `start`/`end`: overview with chapters
+   and timestamps.
+3. `analyze_video` again per chapter, with `start` and `end` from the overview.
+   Every call reuses the copy from step 1.
+4. `manage_local_video` with `action: "delete"` when you are done, or let the
+   copy expire after 48 hours.
+
+About timeouts in Claude Code: a single MCP tool call has a hard limit of about
+28 hours by default (`MCP_TOOL_TIMEOUT`), which is not the issue. The issue is
+the idle timeout: a stdio tool call that sends neither a response nor a progress
+notification for 30 minutes is aborted (`CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT`,
+Claude Code 2.1.203 or later). The server sends a progress notification every
+minute while it works, provided the client asks for progress. If a call is
+aborted anyway, the upload keeps running inside the server process, and the next
+call for the same file waits for it instead of starting a second one. For a
+guaranteed margin, set a per-server `timeout` in `.mcp.json`, which also acts as
+a floor for the idle timeout:
+
+```json
+{
+  "mcpServers": {
+    "gemini-video": {
+      "command": "node",
+      "args": ["/path/to/gemini-video-mcp/src/index.js"],
+      "timeout": 3600000
+    }
+  }
+}
+```
+
+If the server process is killed in the middle of an upload, the SDK's resumable
+upload is never finalised, so no usable file should appear at Google. This
+follows from the upload protocol and has not been tested by killing a live
+upload. Anything that does get stuck shows up under `action: "status"` and can
+be deleted.
+
+Keep in mind that on the free tier Google may use submitted content to improve
+its products. Decide before uploading a private video.
 
 ## Model fallback chain
 
@@ -367,7 +455,8 @@ the error path.
 | `src/index.js` | MCP server, stdio transport, tool registration |
 | `src/analyze.js` | Input validation, mode selection, orchestration, result formatting |
 | `src/gemini.js` | Wrapper around `@google/genai` → `interactions`, error translation |
-| `src/quelle.js` | Platform detection, YouTube vs Instagram vs rejected |
+| `src/quelle.js` | Platform detection, YouTube vs Instagram vs local file vs rejected |
+| `src/lokal.js` | Local files: validation, upload once and reuse, status, delete |
 | `src/ytdlp.js` | Instagram download via yt-dlp, error translation |
 | `src/files.js` | Gemini Files API: upload, wait for `ACTIVE`, delete |
 | `src/prompt.js` | Default prompt and time-range addendum |
@@ -387,8 +476,10 @@ Node script.
 | `GEMINI_TIMEOUT_MS` | no | `600000` | Timeout for the analysis request, in milliseconds |
 | `YTDLP_PATH` | no | `yt-dlp` from `PATH` | Full path to the yt-dlp executable (Instagram only) |
 | `YTDLP_TIMEOUT_MS` | no | `300000` | Timeout for the Instagram download |
-| `UPLOAD_TIMEOUT_MS` | no | `300000` | How long to wait for Gemini to process an uploaded file |
+| `UPLOAD_TIMEOUT_MS` | no | `300000` | How long to wait for Gemini to process an uploaded Instagram file |
 | `MAX_VIDEO_MB` | no | `250` | Size ceiling for a downloaded Instagram video |
+| `LOKAL_UPLOAD_TIMEOUT_MS` | no | `1800000` | How long to wait for Gemini to process an uploaded local file |
+| `LOKAL_MAX_MB` | no | `2000` | Size ceiling for a local file, in decimal megabytes |
 
 ## License
 

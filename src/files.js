@@ -1,8 +1,8 @@
 /**
  * Gemini Files API: hochladen, auf die Verarbeitung warten, wieder loeschen.
  *
- * Nur fuer den Instagram-Pfad noetig. YouTube-Videos holt sich Gemini selbst
- * ueber die URI, dort wird nichts hochgeladen.
+ * Noetig fuer den Instagram-Pfad und fuer lokale Dateien. YouTube-Videos holt
+ * sich Gemini selbst ueber die URI, dort wird nichts hochgeladen.
  */
 
 import { holeClient, FehlerGemini } from './gemini.js';
@@ -22,9 +22,10 @@ const ABFRAGE_ABSTAND_MS = 2000;
  * @param {string} pfad
  * @param {string} mimeTyp
  * @param {string} [anzeigename]
+ * @param {number} [timeoutMs]  Wartezeit auf ACTIVE, sonst UPLOAD_TIMEOUT_MS bzw. 5 Minuten.
  * @returns {Promise<{name: string, uri: string, mimeTyp: string}>}
  */
-export async function ladeHoch(pfad, mimeTyp, anzeigename) {
+export async function ladeHoch(pfad, mimeTyp, anzeigename, timeoutMs = verarbeitungTimeout()) {
   const client = holeClient();
 
   let datei;
@@ -49,7 +50,7 @@ export async function ladeHoch(pfad, mimeTyp, anzeigename) {
     );
   }
 
-  const fertig = await warteAufAktiv(client, datei);
+  const fertig = await warteAufAktiv(client, datei, timeoutMs);
 
   if (!fertig.uri) {
     // Die Datei existiert bei Google, ist aber unbrauchbar -- weg damit.
@@ -64,15 +65,15 @@ export async function ladeHoch(pfad, mimeTyp, anzeigename) {
 }
 
 /** Fragt den Zustand ab, bis die Datei ACTIVE ist. */
-async function warteAufAktiv(client, datei) {
-  const bis = Date.now() + verarbeitungTimeout();
+export async function warteAufAktiv(client, datei, timeoutMs = verarbeitungTimeout()) {
+  const bis = Date.now() + timeoutMs;
   let aktuell = datei;
 
   while (aktuell?.state === 'PROCESSING' || aktuell?.state === 'STATE_UNSPECIFIED') {
     if (Date.now() > bis) {
       await loescheDatei(aktuell.name);
       throw new FehlerGemini(
-        `Gemini hat das Video nicht innerhalb von ${Math.round(verarbeitungTimeout() / 1000)} ` +
+        `Gemini hat das Video nicht innerhalb von ${Math.round(timeoutMs / 1000)} ` +
           'Sekunden verarbeitet. Bei langen Videos kann das vorkommen -- erneut versuchen oder ' +
           'ein kuerzeres Video waehlen.',
         'verarbeitung_timeout',
