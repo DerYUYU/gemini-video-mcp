@@ -7,6 +7,7 @@
  * Das Feld `processing` existiert in generateContent ausserdem gar nicht.
  */
 
+import { setTimeout as warte } from 'node:timers/promises';
 import { GoogleGenAI } from '@google/genai';
 
 export const DEFAULT_MODELL = 'gemini-3.8-flash';
@@ -27,7 +28,25 @@ export const DEFAULT_KETTE = [
 /** Nur diese Zustaende rechtfertigen einen Modellwechsel. */
 const AUSWEICH_STATUS = new Set([429, 503]);
 
+/**
+ * Pausen vor der zweiten und dritten Runde durch die Kette, und vor dem einen
+ * erneuten Versuch nach einem kurzen Verbindungsabbruch. Weitere Runden gibt
+ * es nur nach einem 503: "Server ueberlastet" ist meist nach Minuten vorbei,
+ * ein erschoepftes Tageskontingent (429) wird durch Warten nicht besser.
+ */
+export const PAUSEN_MS = { runden: [20 * 1000, 60 * 1000], netz: 2 * 1000 };
+
+/** Ursachen von "fetch failed", die auf einen kurzen Abbruch deuten. */
+const KURZE_NETZFEHLER = new Set([
+  'ECONNRESET',
+  'UND_ERR_SOCKET',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'UND_ERR_CONNECT_TIMEOUT',
+]);
+
 let clientCache = null;
+let dispatcherCache;
 
 /** Liefert den Gemini-Client. Wirft eine klare Meldung, wenn der Key fehlt. */
 export function holeClient() {
@@ -61,9 +80,19 @@ export function resetClient() {
  * @param {string} [p.mimeTyp]  Nur fuer hochgeladene Dateien noetig.
  * @param {string} [p.modell]
  * @param {number} [p.timeoutMs]
- * @returns {Promise<{text: string, tokens: number|null, status: string, modell: string, usage: object}>}
+ * @param {{runden: number[], netz: number}} [p.pausen]  Nur fuer Tests kuerzer als PAUSEN_MS.
+ * @returns {Promise<{text: string, tokens: number|null, status: string, modell: string, usage: object, uebersprungen: object[], runden: number}>}
  */
-export async function frageVideo({ url, prompt, processing, resolution, mimeTyp, modell, timeoutMs }) {
+export async function frageVideo({
+  url,
+  prompt,
+  processing,
+  resolution,
+  mimeTyp,
+  modell,
+  timeoutMs,
+  pausen = PAUSEN_MS,
+}) {
   const client = holeClient();
   const kette = modellKette(modell);
 
@@ -74,15 +103,92 @@ export async function frageVideo({ url, prompt, processing, resolution, mimeTyp,
   if (mimeTyp) video.mime_type = mimeTyp;
 
   const eingabe = [video, { type: 'text', text: prompt }];
-  const uebersprungen = [];
+  // Letzter Ausweich-Status je Modell. Ein 429 sperrt das Modell fuer die
+  // weiteren Runden, ein 503 nicht.
+  const letzterStatus = new Map();
+  let letzterFehler = null;
 
-  for (let i = 0; i < kette.length; i += 1) {
-    const modellName = kette[i];
-    const letztes = i === kette.length - 1;
+  for (let runde = 1; ; runde += 1) {
+    const offen = kette.filter((m) => letzterStatus.get(m) !== 429);
 
-    let antwort;
+    for (const modellName of offen) {
+      const { antwort, fehler, sekunden } = await frageModell(
+        client,
+        modellName,
+        eingabe,
+        timeoutMs,
+        pausen.netz,
+      );
+
+      if (fehler) {
+        const status = statusVon(fehler);
+        // Nur Kontingent und Ueberlastung rechtfertigen einen Wechsel. Ein
+        // kaputter Key oder ein privates Video wuerde bei jedem Modell genauso
+        // scheitern -- weiterzuprobieren wuerde nur Kontingent verbrennen.
+        if (!AUSWEICH_STATUS.has(status)) {
+          throw uebersetzeFehler(fehler, url, await pruefeKey(client, fehler), sekunden);
+        }
+        letzterStatus.set(modellName, status);
+        letzterFehler = fehler;
+        continue;
+      }
+
+      const text = leseAntworttext(antwort);
+      if (!text) {
+        throw new FehlerGemini(
+          `Die API hat geantwortet (Status "${antwort?.status ?? 'unbekannt'}"), aber keinen auswertbaren ` +
+            'Text geliefert. Versuche es mit einer konkreteren Frage oder einem kuerzeren Ausschnitt.',
+          'leere_antwort',
+        );
+      }
+
+      return {
+        text,
+        tokens: typeof antwort?.usage?.total_tokens === 'number' ? antwort.usage.total_tokens : null,
+        status: antwort?.status ?? 'unbekannt',
+        modell: antwort?.model ?? modellName,
+        usage: antwort?.usage ?? {},
+        // Alles vor dem antwortenden Modell ist in dieser Runde gescheitert
+        // oder seit einer frueheren Runde wegen 429 gesperrt.
+        uebersprungen: kette
+          .slice(0, kette.indexOf(modellName))
+          .map((m) => ({ modell: m, status: letzterStatus.get(m) })),
+        runden: runde,
+      };
+    }
+
+    // Ein einzelnes Modell ohne 503 meldet sich wie eh und je mit dem
+    // passenden Einzelfehler statt mit einer Kette aus einem Glied.
+    if (kette.length === 1 && runde === 1 && statusVon(letzterFehler) !== 503) {
+      throw uebersetzeFehler(letzterFehler, url);
+    }
+
+    const ueberlastet = offen.filter((m) => letzterStatus.get(m) === 503);
+    if (!ueberlastet.length || runde > pausen.runden.length) {
+      throw ketteErschoepft(letzterStatus, runde);
+    }
+
+    const pause = pausen.runden[runde - 1];
+    process.stderr.write(
+      `gemini-video-mcp: Runde ${runde} ohne Antwort, ueberlastet (HTTP 503): ${ueberlastet.join(', ')}. ` +
+        `Naechste Runde in ${Math.round(pause / 1000)} s.\n`,
+    );
+    await warte(pause);
+  }
+}
+
+/**
+ * Ein Aufruf bei einem Modell, nach einem kurzen Verbindungsabbruch einmal
+ * wiederholt. Wirft nicht, sondern liefert den Fehler samt Laufzeit zurueck,
+ * damit die Meldung sagen kann, nach wie vielen Sekunden es abbrach.
+ */
+async function frageModell(client, modellName, eingabe, timeoutMs, netzPauseMs) {
+  const dispatcher = dispatcherOhneFristen();
+
+  for (let versuch = 1; ; versuch += 1) {
+    const beginn = Date.now();
     try {
-      antwort = await client.interactions.create(
+      const antwort = await client.interactions.create(
         { model: modellName, input: eingabe },
         {
           timeout_ms: timeoutMs ?? DEFAULT_TIMEOUT_MS,
@@ -92,45 +198,49 @@ export async function frageVideo({ url, prompt, processing, resolution, mimeTyp,
           // Kontingentverschwendung -- das Ausweichen auf das naechste Modell
           // ist die richtige Antwort, nicht ein erneuter Versuch beim selben.
           retries: { strategy: 'none' },
+          ...(dispatcher && { fetch_options: { dispatcher } }),
         },
       );
+      return { antwort };
     } catch (fehler) {
-      const status = statusVon(fehler);
-
-      // Nur Kontingent und Ueberlastung rechtfertigen einen Wechsel. Ein
-      // kaputter Key oder ein privates Video wuerde bei jedem Modell genauso
-      // scheitern -- weiterzuprobieren wuerde nur Kontingent verbrennen.
-      if (AUSWEICH_STATUS.has(status) && !letztes) {
-        uebersprungen.push({ modell: modellName, status });
-        continue;
-      }
-      if (AUSWEICH_STATUS.has(status) && uebersprungen.length) {
-        uebersprungen.push({ modell: modellName, status });
-        throw ketteErschoepft(uebersprungen);
-      }
-      throw uebersetzeFehler(fehler, url, await pruefeKey(client, fehler));
-    }
-
-    const text = leseAntworttext(antwort);
-    if (!text) {
-      throw new FehlerGemini(
-        `Die API hat geantwortet (Status "${antwort?.status ?? 'unbekannt'}"), aber keinen auswertbaren ` +
-          'Text geliefert. Versuche es mit einer konkreteren Frage oder einem kuerzeren Ausschnitt.',
-        'leere_antwort',
+      const sekunden = Math.round((Date.now() - beginn) / 1000);
+      const code = ursachenCode(fehler);
+      if (versuch > 1 || !KURZE_NETZFEHLER.has(code)) return { fehler, sekunden };
+      process.stderr.write(
+        `gemini-video-mcp: ${modellName} Verbindung nach ${sekunden} s abgebrochen (${code}), ` +
+          `neuer Versuch in ${Math.round(netzPauseMs / 1000)} s.\n`,
       );
+      await warte(netzPauseMs);
     }
-
-    return {
-      text,
-      tokens: typeof antwort?.usage?.total_tokens === 'number' ? antwort.usage.total_tokens : null,
-      status: antwort?.status ?? 'unbekannt',
-      modell: antwort?.model ?? modellName,
-      usage: antwort?.usage ?? {},
-      uebersprungen,
-    };
   }
+}
 
-  throw ketteErschoepft(uebersprungen);
+/**
+ * Eigener undici-Agent fuer den Analyse-Aufruf, ohne headersTimeout und
+ * bodyTimeout.
+ *
+ * Node schickt fetch ueber undici, dessen globaler Agent nach 300 Sekunden
+ * ohne Antwortkopf abbricht. Ein nicht gestreamter interactions-Aufruf
+ * liefert den Kopf erst mit dem fertigen Ergebnis, lange agentic-Analysen
+ * scheiterten so nach fuenf Minuten mit "fetch failed" statt nach
+ * DEFAULT_TIMEOUT_MS. Das SDK hebt diese Grenzen auf dem interactions-Weg
+ * nicht an. Ohne die beiden Fristen bleibt timeout_ms die einzige.
+ *
+ * Node exportiert die Agent-Klasse nicht. Sie steckt aber im globalen
+ * Dispatcher, den `new Request` beim ersten Mal anlegt -- so geht es ohne
+ * neue Dependency. Klappt das nicht, bleibt es beim globalen Dispatcher.
+ */
+function dispatcherOhneFristen() {
+  if (dispatcherCache !== undefined) return dispatcherCache;
+  dispatcherCache = null;
+  try {
+    void new Request('http://localhost/');
+    const Agent = globalThis[Symbol.for('undici.globalDispatcher.1')]?.constructor;
+    if (typeof Agent === 'function') dispatcherCache = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+  } catch {
+    // Etwa ein fremder ProxyAgent, der ohne Pflichtangaben nicht startet.
+  }
+  return dispatcherCache;
 }
 
 /**
@@ -155,15 +265,41 @@ function statusVon(fehler) {
   return fehler?.status ?? fehler?.statusCode ?? fehler?.response?.status ?? null;
 }
 
-function ketteErschoepft(uebersprungen) {
-  const liste = uebersprungen.map((u) => `${u.modell} (HTTP ${u.status})`).join(', ');
-  return new FehlerGemini(
-    `Alle verfuegbaren Modelle sind erschoepft oder ueberlastet: ${liste}. Das Tageskontingent des ` +
-      'Free Tier gilt pro Modell und wird taeglich zurueckgesetzt -- morgen geht es also wieder. ' +
-      'Zusaetzliche Modelle lassen sich ueber GEMINI_MODEL_FALLBACKS eintragen, alternativ hilft ' +
-      'ein hoeheres Kontingent (ai.dev/rate-limit).',
-    'kette_erschoepft',
-  );
+/** Sucht in der cause-Kette den ersten Fehlercode, etwa ECONNRESET oder UND_ERR_SOCKET. */
+function ursachenCode(fehler) {
+  for (let f = fehler, tiefe = 0; f && tiefe < 6; f = f.cause, tiefe += 1) {
+    if (typeof f.code === 'string') return f.code;
+  }
+  return null;
+}
+
+/**
+ * Trennt Ueberlastung (503, voruebergehend) von erschoepftem Kontingent (429).
+ * Massgeblich ist der letzte Status je Modell.
+ */
+function ketteErschoepft(letzterStatus, runden) {
+  const mit = (status) =>
+    [...letzterStatus].filter(([, s]) => s === status).map(([m]) => `${m} (HTTP ${status})`);
+  const ueberlastet = mit(503);
+  const erschoepft = mit(429);
+
+  const teile = [];
+  if (ueberlastet.length) {
+    teile.push(
+      `Server ueberlastet: ${ueberlastet.join(', ')}. Das ist voruebergehend und kein Kontingentproblem. ` +
+        `Nach ${runden} ${runden === 1 ? 'Runde' : 'Runden'} durch die Modellkette aufgegeben -- in ` +
+        'einigen Minuten erneut versuchen.',
+    );
+  }
+  if (erschoepft.length) {
+    teile.push(
+      `Tageskontingent erschoepft: ${erschoepft.join(', ')}. Das Tageskontingent des Free Tier gilt pro ` +
+        'Modell und wird taeglich zurueckgesetzt -- morgen geht es also wieder. Zusaetzliche Modelle ' +
+        'lassen sich ueber GEMINI_MODEL_FALLBACKS eintragen, alternativ hilft ein hoeheres Kontingent ' +
+        '(ai.dev/rate-limit).',
+    );
+  }
+  return new FehlerGemini(`Kein Modell der Kette hat geantwortet. ${teile.join(' ')}`, 'kette_erschoepft');
 }
 
 /**
@@ -226,8 +362,9 @@ async function pruefeKey(client, fehler) {
  * @param {unknown} fehler
  * @param {string} url
  * @param {boolean|null} [keyGueltig] Ergebnis von pruefeKey, falls vorhanden.
+ * @param {number|null} [sekunden]   Laufzeit des gescheiterten Aufrufs, falls gemessen.
  */
-export function uebersetzeFehler(fehler, url, keyGueltig = null) {
+export function uebersetzeFehler(fehler, url, keyGueltig = null, sekunden = null) {
   const status = fehler?.status ?? fehler?.statusCode ?? fehler?.response?.status ?? null;
   const roh = String(fehler?.message ?? fehler ?? '');
   const klein = roh.toLowerCase();
@@ -330,8 +467,11 @@ export function uebersetzeFehler(fehler, url, keyGueltig = null) {
     klein.includes('econnrefused') ||
     klein.includes('getaddrinfo')
   ) {
+    const ursache = ursachenCode(fehler) ?? 'unbekannt';
+    const dauer = sekunden === null ? '' : `, Abbruch nach ${sekunden} s`;
     return new FehlerGemini(
-      'Keine Verbindung zur Gemini-API moeglich. Pruefe Netzwerkverbindung bzw. Proxy.',
+      `Die Verbindung zur Gemini-API ist gescheitert (Ursache ${ursache}${dauer}). ` +
+        'Pruefe Netzwerkverbindung bzw. Proxy.',
       'netzwerk',
       fehler,
     );

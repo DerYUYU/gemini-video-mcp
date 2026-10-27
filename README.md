@@ -384,8 +384,18 @@ Rules:
 - **Only 429 and 503 trigger a switch.** An invalid key, a private video or a
   malformed argument fails the same way on every model, so retrying would just
   burn quota. Those errors are reported immediately.
-- **Each model is tried at most once.** When the whole chain is exhausted, the
-  error says so and points out that the quota resets daily.
+- **A 503 earns another round, a 429 does not.** When every model in the chain
+  fails and at least one failure was a 503 (overloaded, usually over within
+  minutes), the server waits and runs through the chain again, at most two more
+  times, after pauses of about 20 and 60 seconds. Models that returned 429 are
+  skipped in those rounds, because waiting does not restore a daily quota. If
+  the chain is still exhausted, the error keeps the two cases apart: overload
+  means try again in a few minutes, an exhausted quota resets daily.
+- **A brief network drop gets one retry.** If the connection breaks with a
+  cause that points to a short interruption (`ECONNRESET`, `UND_ERR_SOCKET`,
+  `ETIMEDOUT`, `EAI_AGAIN`, `UND_ERR_CONNECT_TIMEOUT`), the same model is tried
+  once more. A network error that persists names its cause code and how many
+  seconds passed before the request failed.
 - **The switch is never silent.** The answer always names the model that
   responded, and when a fallback was used, the notes say which models were
   skipped and why.

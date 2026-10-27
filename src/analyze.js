@@ -96,6 +96,12 @@ export async function analyseVideo(args = {}, { melde } = {}) {
         'Das Tageskontingent gilt pro Modell und wird taeglich zurueckgesetzt.',
     );
   }
+  if (ergebnis.runden > 1) {
+    hinweise.push(
+      `Antwort erst in Runde ${ergebnis.runden} durch die Modellkette: davor waren die Modelle ` +
+        'ueberlastet (HTTP 503), nach einer Pause hat der Server wieder geantwortet.',
+    );
+  }
 
   return {
     text: ergebnis.text,
